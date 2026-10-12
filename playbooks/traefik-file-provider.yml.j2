@@ -28,6 +28,7 @@ http:
       tls:
         certresolver: le
       middlewares:
+        - cors-headers
         - security-headers
 {% endif %}
 {% endfor %}
@@ -51,6 +52,7 @@ http:
         - https
       priority: 1
       middlewares:
+        - cors-headers
         - security-headers
 
     # ----- Traefik API (under traefik.<apex>/api) -----
@@ -84,6 +86,45 @@ http:
         stsIncludeSubdomains: true
         stsPreload: true
         stsSeconds: 31536000
+
+    # ★ CORS middleware (★ added 2026-10-12, lazydog directive after
+    # CORS-2026-10-12 regression). Traefik v3 was stripping Allow-Origin
+    # from upstream responses in some scenarios (OPTIONS preflight
+    # specifically); Frappe's set_cors_headers was not reaching the
+    # browser. This middleware explicitly sets the CORS headers at the
+    # Traefik layer, using nginx_cors_allowed_origins from group_vars/pitaas.yml
+    # (the same source of truth that drives Frappe's allow_cors).
+    #
+    # Traefik's accessControlAllowOriginList:
+    # - When request's Origin matches one in the list, Traefik sets
+    #   Access-Control-Allow-Origin: <Origin> + Vary: Origin +
+    #   Access-Control-Allow-Credentials: true.
+    # - When request's Origin is NOT in the list, no Allow-Origin header
+    #   is sent (browser will reject the request).
+    # - For OPTIONS preflight, Access-Control-Allow-Methods +
+    #   Access-Control-Allow-Headers are also added (echoing the
+    #   Access-Control-Request-Method / Access-Control-Request-Headers).
+    cors-headers:
+      headers:
+        accessControlAllowOriginList:
+{% for origin in nginx_cors_allowed_origins %}
+          - '{{ origin }}'
+{% endfor %}
+        accessControlAllowCredentials: true
+        accessControlAllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+          - PUT
+          - DELETE
+        accessControlAllowHeaders:
+          - Content-Type
+          - Authorization
+          - X-Frappe-CSRF-Token
+        accessControlExposeHeaders:
+          - Set-Cookie
+        accessControlMaxAge: 86400
+        addVaryHeader: true
 
 # NOTE: tls.certificatesResolvers.le is configured via the traefik CLI args
 # in compose.traefik.yaml / compose.traefik-ssl.yaml. The file provider
