@@ -1,0 +1,128 @@
+# Traefik file provider: multi-site rules
+# Loaded by pitaas_v3-traefik-1 from /etc/traefik/file-provider/ (mounted as a
+# volume when the container was created; if not mounted, restart traefik with
+# the volume below).
+#
+# Mount: -v /opt/pitaas/pitaas_v3/docker/traefik/file-provider.yml:/etc/traefik/file-provider/file-provider.yml:ro
+# Compose entry: see compose.traefik.yaml for the volume + providers.file stanza.
+#
+# ★ The file provider only accepts STATIC config. Dynamic config (routers
+# discovered via Docker labels, TLS certs via ACME) is configured via the
+# Docker provider's labels + CLI args. So this file has only http.routers,
+# http.services, http.middlewares. The certificatesResolvers is in
+# the traefik command (CLI args).
+
+http:
+  routers:
+    # Multi-tenant HTTP router: <slug>.pitaas.rtcnexora.com -> frontend (http)
+    pitaas-tenant-http:
+      rule: "HostRegexp(`^.+\\.pitaas\\.rtcnexora\\.com$`)"
+      service: pitaas-frontend
+      entryPoints:
+        - http
+      middlewares:
+        - https-redirect
+
+    # ★ 2026-10-11: per-domain HTTPS routers (NOT HostRegexp). Traefik's
+    # certResolver only auto-detects the cert domain from `Host()` rules;
+    # HostRegexp triggers "No domain found in rule". We add one router
+    # per known apex subdomain. New customers add one router here +
+    # one DNS A record + one Frappe site (no other infra changes).
+    # Certs are issued per-subdomain via TLS-ALPN-01 (port 443).
+    apex-https:
+      rule: "Host(`apex.pitaas.rtcnexora.com`)"
+      service: pitaas-frontend
+      entryPoints:
+        - https
+      tls:
+        certresolver: le
+      middlewares:
+        - security-headers
+
+    dev-https:
+      rule: "Host(`dev.pitaas.rtcnexora.com`)"
+      service: pitaas-frontend
+      entryPoints:
+        - https
+      tls:
+        certresolver: le
+      middlewares:
+        - security-headers
+
+    admin-https:
+      rule: "Host(`admin.pitaas.rtcnexora.com`)"
+      service: pitaas-frontend
+      entryPoints:
+        - https
+      tls:
+        certresolver: le
+      middlewares:
+        - security-headers
+
+    auditor-https:
+      rule: "Host(`auditor.pitaas.rtcnexora.com`)"
+      service: pitaas-frontend
+      entryPoints:
+        - https
+      tls:
+        certresolver: le
+      middlewares:
+        - security-headers
+
+    traefik-https:
+      rule: "Host(`traefik.pitaas.rtcnexora.com`)"
+      service: api@internal
+      entryPoints:
+        - https
+      tls:
+        certresolver: le
+
+    # Catch-all HTTPS router: any other *.pitaas.rtcnexora.com subdomain
+    # is served with the default cert (browser warning, but functional).
+    # New customers need to be added above; this is a safety net.
+    pitaas-tenant-https-catchall:
+      rule: "HostRegexp(`^.+\\.pitaas\\.rtcnexora\\.com$`)"
+      service: pitaas-frontend
+      entryPoints:
+        - https
+      priority: 1
+      middlewares:
+        - security-headers
+
+    # ★ Traefik API on internal-port-8080 (only via Host: traefik.pitaas.rtcnexora.com)
+    # This duplicates the docker-label-based dashboard route, but ensures
+    # the file provider has at least one route we can verify.
+    api-internal:
+      rule: "Host(`traefik.pitaas.rtcnexora.com`) && PathPrefix(`/api`)"
+      service: api@internal
+      entryPoints:
+        - http
+        - https
+
+  services:
+    pitaas-frontend:
+      loadBalancer:
+        servers:
+          - url: "http://pitaas_v3-frontend-1:8080"
+        passHostHeader: true
+
+  middlewares:
+    https-redirect:
+      redirectScheme:
+        scheme: https
+        permanent: true
+
+    security-headers:
+      headers:
+        frameDeny: true
+        sslRedirect: true
+        browserXssFilter: true
+        contentTypeNosniff: true
+        forceSTSHeader: true
+        stsIncludeSubdomains: true
+        stsPreload: true
+        stsSeconds: 31536000
+
+# NOTE: tls.certificatesResolvers.le is configured via the traefik CLI args
+# in compose.traefik.yaml / compose.traefik-ssl.yaml. The file provider
+# doesn't support this section.

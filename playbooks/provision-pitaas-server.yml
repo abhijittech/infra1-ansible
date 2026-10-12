@@ -1,0 +1,385 @@
+---
+# ~/.hermes/profiles/infra1/ansible/playbooks/provision-pitaas-server.yml
+#
+# ★★ PROVISION A NEW PITAAS SERVER (cold start, end-to-end) ★★
+#
+# What this playbook does, in order:
+#   1.  Bootstrap the host (apt update, install docker, git, rsync)
+#   2.  Create the deployer user (if not present) and add to docker group
+#   3.  Add the SSH public key to authorized_keys
+#   4.  Harden sshd (PermitRootLogin no, PasswordAuthentication no)
+#   5.  Rsync pitaas_v3 source from WSL controller to /opt/pitaas/pitaas_v3
+#   6.  Generate secrets server-side (DB password, encryption key, etc.)
+#   7.  Render docker/.env from pass + group_vars (per-env config)
+#   8.  Render traefik-file-provider.yml + fe-bundles-nginx.conf
+#       from nginx_per_host list (per-domain blocks for cert issuance)
+#   9.  Bring up the docker compose stack (traefik, mariadb, redis, backend, etc.)
+#  10.  Run bench setup + create the default Frappe site
+#  11.  Install the pitaas + erpnext apps on the default site
+#  12.  Run pitaas.install.* bootstrap functions (custom fields, RBAC, seed)
+#  13.  Re-render nginx + reload (the FE bundles need to be in place first)
+#  14.  Print the LE-cert-issued status for each subdomain
+#  15.  Print the post-provision summary (URLs, admin creds from pass, etc.)
+#
+# ★ Pre-flight (manual, lazydog must do before running this):
+#   - Procure a fresh Ubuntu 24.04 server with SSH as root reachable.
+#   - Add a DNS A record for the env's public_domain_apex (e.g. pitaas.rtcnexora.com)
+#     pointing to the server's public IP.
+#   - Add DNS A records for each subdomain in nginx_per_host (apex, dev, etc.).
+#     Without these, the LE cert issuance will fail with NXDOMAIN.
+#   - Populate the pass entries:
+#       infra1/pitaas-<env>/mariadb-root
+#       infra1/pitaas-<env>/traefik-basicauth
+#       infra1/pitaas-v3/seed-admin-password
+#       infra1/pitaas-v3-dev.local/db-password
+#       infra1/pitaas-v3-<env>.local/encryption-key
+#     (use `pass generate` for random ones; `pass insert` for known ones)
+#   - Add the host to inventory.yml as a member of pitaas_dev (or pitaas_<env>).
+#   - Run this playbook with --check first to see what would change.
+#
+# Usage:
+#   deploy pitaas pitaas-dev-1 provision --check
+#   deploy pitaas pitaas-dev-1 provision
+#   ansible-playbook -i inventory.yml playbooks/provision-pitaas-server.yml --limit pitaas_dev_1 --check
+#
+# ★ Re-runnable: this is idempotent. Re-running on a provisioned host
+# should be a no-op except for the last steps (cert + bundle deploy).
+- name: "PROVISION pitaas server (cold start)"
+  hosts: "{{ target_group | default('pitaas_dev') }}"
+  become: true
+  gather_facts: true
+  vars:
+    ansible_ssh_common_args: >-
+      -o UserKnownHostsFile=/dev/null
+      -o StrictHostKeyChecking=no
+      -o LogLevel=ERROR
+  tasks:
+
+    # ------------------------------------------------------------------
+    # 1. Bootstrap the host (apt update, install docker, git, rsync, etc.)
+    # ------------------------------------------------------------------
+    - name: "1/15 apt update + install base packages"
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - git
+          - rsync
+          - gnupg
+          - lsb-release
+          - python3-passlib
+        state: present
+        cache_valid_time: 3600
+
+    - name: "1/15 install docker.io (Ubuntu 24.04 has it in repo)"
+      ansible.builtin.apt:
+        name: docker.io
+        state: present
+
+    - name: "1/15 install docker compose v2 plugin (apt package)"
+      ansible.builtin.apt:
+        name: docker-compose-v2
+        state: present
+      when: false  # ★ docker-compose-v2 in apt is a transitional package;
+                   # the actual plugin comes from docker.io. Leave disabled.
+
+    - name: "1/15 verify docker + compose are installed"
+      ansible.builtin.command: "docker --version && docker compose version"
+      changed_when: false
+      register: docker_check
+      failed_when: docker_check.rc != 0
+
+    - name: "1/15 ensure docker service is running + enabled at boot"
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    # ------------------------------------------------------------------
+    # 2. Create the deployer user (idempotent)
+    # ------------------------------------------------------------------
+    - name: "2/15 create deployer user {{ ssh_user }}"
+      ansible.builtin.user:
+        name: "{{ ssh_user }}"
+        shell: /bin/bash
+        groups: [docker, sudo]
+        append: true
+        create_home: true
+        state: present
+
+    - name: "2/15 allow {{ ssh_user }} to sudo NOPASSWD"
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/{{ ssh_user }}"
+        content: "{{ ssh_user }} ALL=(ALL) NOPASSWD: ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "visudo -cf %s"
+
+    # ------------------------------------------------------------------
+    # 3. Add the SSH public key
+    # ------------------------------------------------------------------
+    - name: "3/15 install public key for {{ ssh_user }}"
+      ansible.posix.authorized_key:
+        user: "{{ ssh_user }}"
+        state: present
+        key: "{{ lookup('file', ssh_key_path + '.pub') }}"
+
+    # ------------------------------------------------------------------
+    # 4. Harden sshd (PermitRootLogin no, PasswordAuthentication no)
+    # ★ Vendor-specific: keep root login ENABLED if the data center's
+    # out-of-band console needs it. We just disable password auth for root
+    # (key-only). If lazydog wants PermitRootLogin no too, do it after
+    # the data center confirms the console is configured.
+    # ------------------------------------------------------------------
+    - name: "4/15 write sshd hardening drop-in (key-only, no password)"
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/99-infra1-hardening.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # infra1 hardening (2026-10-11)
+          PermitRootLogin prohibit-password
+          PasswordAuthentication no
+          PubkeyAuthentication yes
+          ChallengeResponseAuthentication no
+          UsePAM yes
+        validate: "sshd -t -f %s"
+
+    - name: "4/15 restart sshd (NOT ssh; we don't want to kill our own session)"
+      ansible.builtin.systemd:
+        name: sshd
+        state: restarted
+
+    # ------------------------------------------------------------------
+    # 5. Rsync pitaas_v3 source from WSL controller to /opt/pitaas/pitaas_v3
+    # ★ We DON'T copy the .env or secrets — those are generated in step 7.
+    # ★ The ssh_key_path here is the controller's key for connecting to
+    # the new host. After step 3, the controller's key is authorized.
+    # ------------------------------------------------------------------
+    - name: "5/15 rsync pitaas_v3 source to remote (excluding .env and secrets)"
+      ansible.posix.synchronize:
+        src: "{{ be_repo_local }}/"
+        dest: "{{ be_repo_remote }}/"
+        delete: false  # ★ don't delete pre-existing files (e.g. acme.json)
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=node_modules"
+          - "--exclude=.pytest_cache"
+          - "--exclude=__pycache__"
+          - "--exclude=*.pyc"
+          - "--exclude=.vscode"
+          - "--exclude=.hermes"
+          - "--exclude=.eggs"
+          - "--exclude=*.egg-info"
+          - "--exclude=.DS_Store"
+          - "--exclude=docker/.env"
+          - "--exclude=docker/.env.*"
+          - "--exclude=.env"
+          - "--exclude=.env.*"
+      delegate_to: localhost
+
+    - name: "5/15 chown rsynced files to {{ ssh_user }}"
+      ansible.builtin.file:
+        path: "{{ be_repo_remote }}"
+        state: directory
+        owner: "{{ ssh_user }}"
+        group: "{{ ssh_user }}"
+        recurse: true
+
+    # ------------------------------------------------------------------
+    # 6. Generate secrets server-side
+    # ★ We DON'T echo secrets back to the chat / journal. We write them
+    # to /opt/pitaas/secrets/ with chmod 600, owned by {{ ssh_user }}.
+    # ★ The actual .env rendering happens in step 7 (uses pass from
+    # the controller; no secrets traverse the wire to the remote).
+    # ------------------------------------------------------------------
+    - name: "6/15 create /opt/pitaas/secrets/ (chmod 700)"
+      ansible.builtin.file:
+        path: /opt/pitaas/secrets
+        state: directory
+        owner: "{{ ssh_user }}"
+        group: "{{ ssh_user }}"
+        mode: "0700"
+
+    # ------------------------------------------------------------------
+    # 7. Render docker/.env from pass (controller) + group_vars (per-env)
+    # ★ This task runs on the controller (delegate_to: localhost) because
+    # pass is on the WSL side, not the remote.
+    # ★ It uses the docker.env.j2 template + lookup('passwordstore', ...).
+    # ------------------------------------------------------------------
+    - name: "7/15 render docker/.env from pass + group_vars"
+      template:
+        src: docker.env.j2
+        dest: "{{ be_repo_local }}/docker/.env.rendered"
+        mode: "0600"
+      delegate_to: localhost
+      run_once: true
+
+    - name: "7/15 rsync rendered .env to remote (chmod 600)"
+      ansible.posix.synchronize:
+        src: "{{ be_repo_local }}/docker/.env.rendered"
+        dest: "{{ be_repo_remote }}/docker/.env"
+        rsync_opts: ["--chmod=600"]
+      delegate_to: localhost
+
+    - name: "7/15 chown .env to {{ ssh_user }} (docker runs as root in container, but file perms matter for compose)"
+      ansible.builtin.file:
+        path: "{{ be_repo_remote }}/docker/.env"
+        owner: "{{ ssh_user }}"
+        group: "{{ ssh_user }}"
+        mode: "0600"
+
+    # ------------------------------------------------------------------
+    # 8. Render traefik-file-provider.yml + fe-bundles-nginx.conf
+    # ★ Templated from nginx_per_host list. New customers: edit
+    # group_vars/pitaas.yml, then run refresh-nginx.yml to regenerate.
+    # ------------------------------------------------------------------
+    - name: "8/15 render traefik-file-provider.yml from nginx_per_host"
+      template:
+        src: traefik-file-provider.yml.j2
+        dest: "{{ be_repo_local }}/docker/traefik/file-provider.yml.rendered"
+        mode: "0644"
+      delegate_to: localhost
+      run_once: true
+
+    - name: "8/15 render fe-bundles-nginx.conf from nginx_per_host"
+      template:
+        src: fe-bundles-nginx.conf.j2
+        dest: "{{ be_repo_local }}/playbooks/files/fe-bundles-nginx.conf.rendered"
+        mode: "0644"
+      delegate_to: localhost
+      run_once: true
+
+    - name: "8/15 rsync rendered traefik + nginx configs to remote"
+      ansible.posix.synchronize:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+      loop:
+        - { src: "{{ be_repo_local }}/docker/traefik/file-provider.yml.rendered", dest: "{{ be_repo_remote }}/docker/traefik/file-provider.yml" }
+        - { src: "{{ be_repo_local }}/playbooks/files/fe-bundles-nginx.conf.rendered", dest: "/tmp/fe-bundles-nginx.conf.rendered" }
+      delegate_to: localhost
+
+    # ------------------------------------------------------------------
+    # 9. Bring up the docker compose stack
+    # ------------------------------------------------------------------
+    - name: "9/15 docker compose up (traefik first, then full stack)"
+      community.docker.docker_compose_v2:
+        project_src: "{{ be_repo_remote }}"
+        env_files:
+          - "{{ be_repo_remote }}/docker/.env"
+        files: "{{ be_compose_files | map('regex_replace', '^(.*)$', be_repo_remote ~ '/\\1') | list }}"
+        state: present
+        pull: missing
+        remove_orphans: true
+      register: compose_up
+
+    - name: "9/15 wait 30s for backend to come up (gunicorn takes a moment)"
+      ansible.builtin.pause:
+        seconds: 30
+
+    # ------------------------------------------------------------------
+    # 10-12. bench setup + create site + install apps + bootstrap
+    # ★ The container bind-mounts /opt/pitaas/pitaas_v3 into the backend,
+    # so we can run `bench` via docker exec.
+    # ------------------------------------------------------------------
+    - name: "10/15 wait for backend to be healthy"
+      ansible.builtin.command: "docker exec pitaas_v3-backend-1 sh -c 'curl -s http://127.0.0.1:8000/api/method/frappe.ping'"
+      register: ping_check
+      until: ping_check.rc == 0
+      retries: 30
+      delay: 5
+      changed_when: false
+      failed_when: false  # Don't fail; we may not have a site yet
+
+    - name: "11/15 create default Frappe site {{ frappe_default_site }}"
+      ansible.builtin.command: >-
+        docker exec -u root pitaas_v3-configurator-1 sh -c
+        "cd /home/frappe/frappe-bench && bench new-site {{ frappe_default_site }}
+         --mariadb-root-password {{ lookup('passwordstore', 'infra1/pitaas-' ~ env ~ '/mariadb-root') }}
+         --admin-password {{ lookup('passwordstore', 'infra1/pitaas-v3/seed-admin-password') }}
+         --install-app frappe --install-app pitaas --install-app erpnext"
+      args:
+        creates: "{{ be_repo_remote }}/sites/{{ frappe_default_site }}"
+      register: site_create
+      changed_when: "'Database created' in site_create.stdout"
+
+    - name: "12/15 run pitaas bootstrap functions on the default site"
+      ansible.builtin.command: >-
+        docker exec pitaas_v3-backend-1 sh -c
+        "cd /home/frappe/frappe-bench && bench --site {{ frappe_default_site }} execute pitaas.install.create_platform_custom_fields"
+      register: bootstrap1
+      changed_when: bootstrap1.rc == 0
+
+    - name: "12/15 run pitaas bootstrap: ensure_rbac_custom_fields"
+      ansible.builtin.command: >-
+        docker exec pitaas_v3-backend-1 sh -c
+        "cd /home/frappe/frappe-bench && bench --site {{ frappe_default_site }} execute pitaas.install.ensure_rbac_custom_fields"
+      register: bootstrap2
+      changed_when: bootstrap2.rc == 0
+
+    - name: "12/15 run pitaas bootstrap: ensure_jit_email_domain"
+      ansible.builtin.command: >-
+        docker exec pitaas_v3-backend-1 sh -c
+        "cd /home/frappe/frappe-bench && bench --site {{ frappe_default_site }} execute pitaas.install.ensure_jit_email_domain"
+      register: bootstrap3
+      changed_when: bootstrap3.rc == 0
+
+    # ------------------------------------------------------------------
+    # 13. (FE bundles deploy is a separate playbook: deploy-fe.yml)
+    # ★ We don't auto-deploy bundles here because that requires
+    # local pnpm install (long) and should be done deliberately.
+    # ------------------------------------------------------------------
+    - name: "13/15 reminder: run deploy-fe.yml to deploy the Vite bundles"
+      ansible.builtin.debug:
+        msg: |
+          ★ NEXT STEP: deploy the FE bundles:
+            deploy pitaas {{ inventory_hostname }} fe
+          This builds the Vite apps locally and rsyncs them to {{ fe_doc_root }}.
+          Then nginx will serve them.
+
+    # ------------------------------------------------------------------
+    # 14. Print summary
+    # ------------------------------------------------------------------
+    - name: "14/15 show LE cert status for each subdomain"
+      ansible.builtin.command: >-
+        docker exec pitaas_v3-traefik-1 sh -c
+        'cat /certificates/acme.json 2>/dev/null | tr "," "\n" | grep -E "main" | head -20'
+      register: cert_status
+      changed_when: false
+      failed_when: false
+
+    - name: "14/15 show provisioned URLs"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          ★ PROVISIONING COMPLETE for {{ inventory_hostname }}
+          ============================================================
+          Public apex:    {{ public_domain_apex }}  →  https://{{ public_domain_apex }}/
+          Subdomains (https only after LE cert is issued):
+          {% for host in nginx_per_host %}
+            https://{{ host.subdomain }}.{{ public_domain_apex }}/    [{{ host.bundle }}]    [{{ host.frappe_site }}.local]    le_cert={{ host.le_cert }}
+          {% endfor %}
+          Traefik dashboard: https://traefik.{{ public_domain_apex }}/  (basicauth)
+          MariaDB root pwd: in pass at infra1/pitaas-{{ env }}/mariadb-root
+          Frappe admin pwd: in pass at infra1/pitaas-v3/seed-admin-password
+          Traefik basicauth: in pass at infra1/pitaas-{{ env }}/traefik-basicauth
+
+          ★ NEXT STEPS:
+            1. deploy pitaas {{ inventory_hostname }} fe           # deploy Vite bundles
+            2. Hit https://apex.{{ public_domain_apex }}/ in browser → login page
+            3. If LE cert is missing, hit the URL anyway (bypass the cert warning
+               on first request); Traefik will issue on first TLS handshake.
+          ============================================================
+
+    - name: "15/15 mark provision complete in journal"
+      ansible.builtin.lineinfile:
+        path: "{{ be_repo_remote }}/provisioned_at"
+        line: "provisioned_at={{ ansible_date_time.iso8601 }}  by=infra1-ansible-provision-pitaas-server.yml"
+        create: true
+        owner: "{{ ssh_user }}"
+        group: "{{ ssh_user }}"
+        mode: "0644"

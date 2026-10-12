@@ -1,0 +1,14 @@
+# Traefik file provider: TEST - simple Host() rule
+http:
+  routers:
+    test-apex:
+      rule: "Host(`apex.pitaas.rtcnexora.com`)"
+      service: pitaas-frontend
+      entryPoints:
+        - http
+  services:
+    pitaas-frontend:
+      loadBalancer:
+        servers:
+          - url: "http://pitaas_v3-frontend-1:8080"
+        passHostHeader: true

@@ -1,0 +1,4 @@
+# host_vars holds per-host vars overrides. Most projects put env-specific
+# overrides in group_vars/<project>_<env>.yml (e.g. group_vars/pitaas_dev.yml).
+# host_vars/ is reserved for the rare cases where a single host needs
+# different vars than its env-defaults. Empty unless you need it.

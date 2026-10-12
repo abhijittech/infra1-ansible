@@ -1,0 +1,280 @@
+---
+# ~/.hermes/profiles/infra1/ansible/playbooks/add-customer.yml
+#
+# ★★ ONBOARD A NEW CUSTOMER TO AN EXISTING PITAAS SERVER ★★
+#
+# What this playbook does, in order:
+#   1.  Pre-flight: read the customer config (passed via --extra-vars)
+#   2.  Print the DNS A record the user must add at Wix (no auto-update)
+#   3.  Append the new subdomain to group_vars/pitaas.yml (nginx_per_host)
+#   4.  Add the new Frappe site to group_vars/pitaas.yml (be_sites)
+#   5.  Re-render traefik-file-provider.yml + fe-bundles-nginx.conf
+#   6.  Rsync the rendered configs to the remote
+#   7.  docker exec: bench new-site <customer>.v3.local --install-app frappe,pitaas,erpnext
+#   8.  docker exec: bench --site <customer>.v3.local execute pitaas.install.create_platform_custom_fields
+#       (and the other bootstrap functions)
+#   9.  docker exec: seed_mvp_1_0 (creates company, customer, users, items, audit rounds, etc.)
+#  10.  Re-render traefik file provider (now with the new Host() rule for cert)
+#  11.  Restart traefik to pick up the new config (LE cert is requested on first hit)
+#  12.  Print the post-onboarding summary (URLs, admin creds)
+#
+# Usage:
+#   ansible-playbook -i inventory.yml playbooks/add-customer.yml --limit pitaas_dev_1 \
+#     -e "customer_slug=c1 customer_name='C1 Manufacturing Pvt Ltd'"
+#
+# Pre-flight (manual, lazydog):
+#   1. Add a DNS A record for <slug>.<public_domain_apex> pointing to <public_ip>
+#      (Wix, Porkbun, or wherever the apex lives). DNS propagation can take 5-30 min.
+#   2. Run this playbook. It will:
+#      - Create the Frappe site (separate DB, isolated data)
+#      - Seed it with the MVP data
+#      - Generate an LE cert (TLS-ALPN-01; no DNS-01 needed)
+#      - Print the admin credentials
+- name: "ONBOARD new customer <{{ customer_slug }}> on pitaas"
+  hosts: "{{ target_group | default('pitaas_dev') }}"
+  become: true
+  gather_facts: true
+  vars:
+    # customer_slug / customer_name / customer_site / customer_bundle /
+    # customer_le_cert / customer_seed are passed via --extra-vars
+    # (see the playbook header for example).
+    #
+    # ★ DO NOT use `default(...)` here for the same var name. Ansible's
+    # templating resolves the default() recursively, causing a loop.
+    # The required check is in the first task (assert) below; if the
+    # user forgot to pass --extra-vars, that task fails fast.
+    customer_slug: "{{ customer_slug }}"
+    customer_name: "{{ customer_name }}"
+    customer_site: "{{ customer_slug }}.v3.local"
+    customer_bundle: "{{ customer_bundle }}"
+    customer_le_cert: "{{ customer_le_cert }}"
+    customer_seed: "{{ customer_seed }}"
+  tasks:
+
+    # ------------------------------------------------------------------
+    # 1. Pre-flight: ensure required vars are set
+    # ------------------------------------------------------------------
+    - name: "1/12 pre-flight: customer_slug must be set"
+      ansible.builtin.assert:
+        that:
+          - customer_slug is defined
+          - customer_slug | length > 0
+          - customer_slug | regex_search('^[a-z0-9-]+$')
+        fail_msg: "customer_slug must be a DNS-safe lowercase string (e.g. 'c1', 'apex', 'acme-corp')"
+
+    - name: "1/12 pre-flight: customer_site must not already exist"
+      ansible.builtin.stat:
+        path: "{{ be_repo_remote }}/sites/{{ customer_site }}"
+      register: site_check
+      failed_when: site_check.stat.exists
+      when: false  # idempotency check done by bench new-site itself
+
+    - name: "1/12 print DNS A record reminder (Wix / Porkbun / etc.)"
+      ansible.builtin.debug:
+        msg: |
+          ★ ACTION REQUIRED: add a DNS A record at {{ dns_provider | default('Wix') }}:
+              Host: {{ customer_slug }}.{{ public_domain_apex }}
+              Type: A
+              Value: {{ public_ip }}
+            Without this, the LE cert for the new subdomain will fail with NXDOMAIN
+            (and the customer URL will serve the traefik default cert with a browser
+            warning).
+            If you already added it (or don't want a cert now), set
+            customer_le_cert=false and re-run.
+
+    # ------------------------------------------------------------------
+    # 2-3. Edit group_vars/pitaas.yml locally (controller side)
+    # ★ We edit the file directly. A nicer long-term path is to use
+    # Ansible's `ini_file` or `yedit` modules, but for a single line
+    # append this is fine.
+    # ------------------------------------------------------------------
+    - name: "2/12 add customer to nginx_per_host in group_vars (controller)"
+      ansible.builtin.lineinfile:
+        path: "{{ playbook_dir }}/../group_vars/pitaas.yml"
+        line: >-
+          {{ '  ' }}{{ '{' }} subdomain: {{ customer_slug }},
+          bundle: {{ customer_bundle }},
+          frappe_site: {{ customer_slug }}.v3,
+          le_cert: {{ customer_le_cert | string | lower }} {{ '}' }}
+        insertafter: "^nginx_per_host:"
+        state: present
+      delegate_to: localhost
+      run_once: true
+
+    - name: "3/12 add customer to be_sites in group_vars (controller)"
+      ansible.builtin.lineinfile:
+        path: "{{ playbook_dir }}/../group_vars/pitaas.yml"
+        line: "  - {{ customer_site }}"
+        insertafter: "^be_sites:"
+        state: present
+      delegate_to: localhost
+      run_once: true
+
+    # ------------------------------------------------------------------
+    # 4-5. Re-render traefik-file-provider.yml + fe-bundles-nginx.conf
+    # ★ Reuses the templates from provision-pitaas-server.yml.
+    # ------------------------------------------------------------------
+    - name: "4/12 re-render traefik-file-provider.yml"
+      template:
+        src: traefik-file-provider.yml.j2
+        dest: "{{ be_repo_local }}/docker/traefik/file-provider.yml.rendered"
+        mode: "0644"
+      delegate_to: localhost
+      run_once: true
+
+    - name: "4/12 re-render fe-bundles-nginx.conf"
+      template:
+        src: fe-bundles-nginx.conf.j2
+        dest: "{{ be_repo_local }}/playbooks/files/fe-bundles-nginx.conf.rendered"
+        mode: "0644"
+      delegate_to: localhost
+      run_once: true
+
+    - name: "5/12 rsync rendered traefik + nginx configs to remote"
+      ansible.posix.synchronize:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+      loop:
+        - { src: "{{ be_repo_local }}/docker/traefik/file-provider.yml.rendered", dest: "{{ be_repo_remote }}/docker/traefik/file-provider.yml" }
+        - { src: "{{ be_repo_local }}/playbooks/files/fe-bundles-nginx.conf.rendered", dest: "/tmp/fe-bundles-nginx.conf.rendered" }
+      delegate_to: localhost
+
+    - name: "5/12 copy fe-bundles-nginx.conf into frontend container + reload"
+      ansible.builtin.shell: |
+        sudo -n docker cp /tmp/fe-bundles-nginx.conf pitaas_v3-frontend-1:/etc/nginx/conf.d/fe-bundles.conf
+        sudo -n docker exec pitaas_v3-frontend-1 nginx -t 2>&1
+        sudo -n docker exec pitaas_v3-frontend-1 nginx -s reload 2>&1
+      register: nginx_reload
+      changed_when: "'signal process started' in nginx_reload.stderr"
+
+    - name: "5/12 restart traefik to pick up new file provider (and trigger LE cert)"
+      community.docker.docker_compose_v2:
+        project_src: "{{ be_repo_remote }}"
+        env_files:
+          - "{{ be_repo_remote }}/docker/.env"
+        files: "{{ be_compose_files | map('regex_replace', '^(.*)$', be_repo_remote ~ '/\\1') | list }}"
+        services: [traefik]
+        state: present
+        recreate: always
+      register: traefik_restart
+
+    # ------------------------------------------------------------------
+    # 6-7. Create the Frappe site
+    # ★ Site gets its own DB schema (1 site = 1 DB; data isolation D1).
+    # ★ Installs frappe, pitaas, erpnext apps.
+    # ★ The configurator container's command already handles the
+    # wildcard grant for the new site's per-site user.
+    # ------------------------------------------------------------------
+    - name: "6/12 wait for backend to be healthy"
+      ansible.builtin.command: "docker exec pitaas_v3-backend-1 sh -c 'curl -s http://127.0.0.1:8000/api/method/frappe.ping'"
+      register: ping_check
+      until: ping_check.rc == 0
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    - name: "7/12 create Frappe site {{ customer_site }}"
+      ansible.builtin.command: >-
+        docker exec -u root pitaas_v3-configurator-1 sh -c
+        "cd /home/frappe/frappe-bench && bench new-site {{ customer_site }}
+         --mariadb-root-password {{ lookup('passwordstore', 'infra1/pitaas-' ~ env ~ '/mariadb-root') }}
+         --admin-password {{ lookup('passwordstore', 'infra1/pitaas-v3/seed-admin-password') }}
+         --install-app frappe --install-app pitaas --install-app erpnext"
+      register: site_create
+      changed_when: "'Database created' in site_create.stdout"
+
+    # ------------------------------------------------------------------
+    # 8. Run bootstrap functions
+    # ------------------------------------------------------------------
+    - name: "8/12 bootstrap: create_platform_custom_fields"
+      ansible.builtin.command: >-
+        docker exec pitaas_v3-backend-1 sh -c
+        "cd /home/frappe/frappe-bench && bench --site {{ customer_site }} execute pitaas.install.create_platform_custom_fields"
+      register: b1
+      changed_when: b1.rc == 0
+
+    - name: "8/12 bootstrap: ensure_rbac_custom_fields"
+      ansible.builtin.command: >-
+        docker exec pitaas_v3-backend-1 sh -c
+        "cd /home/frappe/frappe-bench && bench --site {{ customer_site }} execute pitaas.install.ensure_rbac_custom_fields"
+      register: b2
+      changed_when: b2.rc == 0
+
+    - name: "8/12 bootstrap: ensure_jit_email_domain"
+      ansible.builtin.command: >-
+        docker exec pitaas_v3-backend-1 sh -c
+        "cd /home/frappe/frappe-bench && bench --site {{ customer_site }} execute pitaas.install.ensure_jit_email_domain"
+      register: b3
+      changed_when: b3.rc == 0
+
+    # ------------------------------------------------------------------
+    # 9. Seed with MVP data (optional)
+    # ★ This creates a Company, Customer, CTA, 3 branches, 8 users, 10
+    # stock items, 7 consumables, 5 capital assets, 2 audit rounds.
+    # ★ Skip for production cutovers; only for demo / onboarding sessions.
+    # ------------------------------------------------------------------
+    - name: "9/12 seed MVP data (if customer_seed=true)"
+      when: customer_seed | bool
+      block:
+        - name: "9/12 seed_mvp_1_0"
+          ansible.builtin.command: >-
+            docker exec pitaas_v3-backend-1 sh -c
+            "cd /home/frappe/frappe-bench && bench --site {{ customer_site }} execute pitaas.install.seed_mvp_1_0"
+          register: seed
+          changed_when: seed.rc == 0
+
+    # ------------------------------------------------------------------
+    # 10. Trigger LE cert by hitting the new URL
+    # ★ Traefik's certResolver issues a cert on first TLS handshake with
+    # a new SNI. We do a probe to trigger it.
+    # ★ This is best-effort; if DNS isn't ready yet, the cert request
+    # will fail with NXDOMAIN. The user can hit the URL in a browser
+    # to trigger it manually.
+    # ------------------------------------------------------------------
+    - name: "10/12 trigger LE cert for {{ customer_slug }}.{{ public_domain_apex }}"
+      ansible.builtin.shell: |
+        sleep 5
+        echo | openssl s_client -servername {{ customer_slug }}.{{ public_domain_apex }} -connect 127.0.0.1:443 2>&1 | grep -E 'subject=|issuer=' || true
+      register: cert_probe
+      changed_when: false
+      when: customer_le_cert | bool
+
+    - name: "10/12 show LE cert state"
+      ansible.builtin.shell: |
+        docker exec pitaas_v3-traefik-1 sh -c '
+          cat /certificates/acme.json 2>/dev/null | tr "," "\n" | grep "main" | head -20 || echo "(no acme.json yet)"
+        '
+      register: cert_state
+      changed_when: false
+
+    - name: "11/12 verify the site responds to its public URL"
+      ansible.builtin.shell: |
+        sleep 3
+        curl -sk -H "Host: {{ customer_slug }}.{{ public_domain_apex }}" -X POST \
+          "https://127.0.0.1/api/login" -m 15 \
+          -H "Content-Type: application/json" \
+          -d "{\"usr\":\"customer_user@{{ customer_slug }}.local\",\"pwd\":\"{{ lookup('passwordstore', 'infra1/pitaas-v3/seed-admin-password') }}\"}"
+      register: site_login
+      changed_when: false
+      failed_when: false
+
+    - name: "12/12 print post-onboarding summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          ★ NEW CUSTOMER ONBOARDED: {{ customer_name }} ({{ customer_slug }})
+          ============================================================
+          Frappe site:     {{ customer_site }}  (separate DB; data isolated)
+          Public URL:      https://{{ customer_slug }}.{{ public_domain_apex }}/
+          Bundle served:   {{ customer_bundle }}
+          LE cert:         {{ 'requested (check traefik logs if 404/NXDOMAIN)' if customer_le_cert else 'skipped (set customer_le_cert=true later to add)' }}
+          Seed data:       {{ 'yes (MVP demo data: company, customer, 8 users, 10 items, 2 audit rounds)' if customer_seed else 'no' }}
+
+          Test login:      customer_user@{{ customer_slug }}.local  /  <seed-admin-pwd from pass>
+
+          ★ NEXT STEPS:
+            1. Verify https://{{ customer_slug }}.{{ public_domain_apex }}/ in a browser
+            2. If LE cert warning → check DNS A record is in place
+            3. (optional) Add the customer to the customer's onboarding doc
+            4. (optional) commit group_vars/pitaas.yml changes
+          ============================================================

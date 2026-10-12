@@ -1,0 +1,74 @@
+# ~/.hermes/profiles/infra1/ansible/inventory.yml
+# Multi-project, multi-server inventory. One host per (project, env, server_id) row.
+#
+# ★ The projects/<slug>.yaml is the human-readable source of truth for
+# env-keyed SSH creds. This inventory is what Ansible consumes; the
+# shared shape is duplicated by design (Ansible needs a specific format).
+# When projects/<slug>.yaml changes, run scripts/regen-inventory.sh to
+# regenerate this file. (regen-inventory.sh is a small Python script
+# that reads each project's YAML and writes the corresponding hosts.)
+#
+# Conventions:
+# - server_id is kebab-case: <project>-<env>-<N> (e.g., pitaas-dev-1)
+# - group name = <project>_<env>  (e.g., pitaas_dev)
+# - parent group = <project>      (e.g., pitaas)
+# - top-level [all:vars] has cross-cutting defaults (ssh key paths, etc.)
+
+all:
+  vars:
+    # ★ Per-project SSH keys live in ~/.hermes/profiles/infra1/ssh/<slug>_<purpose>.
+    # This default assumes pitaas; per-host vars override for LGS, rpkg, etc.
+    ansible_ssh_private_key_file: ~/.hermes/profiles/infra1/ssh/pitaas_dev_admin
+    # ★ ansible_ssh_common_args is a single string of ssh -o options.
+    ansible_ssh_common_args: >-
+      -o StrictHostKeyChecking=accept-new
+      -o UserKnownHostsFile={{ lookup('env', 'HOME') }}/.hermes/profiles/infra1/ssh/known_hosts
+      -o ConnectTimeout=8
+    ansible_python_interpreter: /usr/bin/python3
+
+  children:
+    # ============================================================
+    # pitaas
+    # ============================================================
+    pitaas:
+      children:
+        pitaas_dev:
+          hosts:
+            pitaas_dev_1:                       # ★ canonical ansible hostname; alias for server_id
+              ansible_host: 103.117.50.250
+              ansible_port: 4422
+              ansible_user: pit_deploy_usr1
+              server_id: pitaas-dev-1
+              os_hostname: HYRH-VPC339
+              env: dev
+              # ★ When staging/prod land, add new children groups here.
+        # pitaas_staging: (future)
+        # pitaas_prod: (future)
+
+    # ============================================================
+    # lgs  (placeholder; lgs_frontend is a separate repo, topology TBD)
+    # ============================================================
+    # lgs:
+    #   children:
+    #     lgs_dev:
+    #       hosts:
+    #         lgs_dev_1:
+    #           ansible_host: ...
+    #           ansible_port: ...
+    #           ansible_user: ...
+    #           server_id: lgs-dev-1
+    #           env: dev
+
+    # ============================================================
+    # rpkg  (placeholder; rpkg infra TBD)
+    # ============================================================
+    # rpkg:
+    #   children:
+    #     rpkg_dev:
+    #       hosts:
+    #         rpkg_dev_1:
+    #           ansible_host: ...
+    #           ansible_port: ...
+    #           ansible_user: ...
+    #           server_id: rpkg-dev-1
+    #           env: dev

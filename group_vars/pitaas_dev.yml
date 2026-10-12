@@ -1,0 +1,60 @@
+# ~/.hermes/profiles/infra1/ansible/group_vars/pitaas_dev.yml
+# Per-env overrides for pitaas-dev-1 (the dev server).
+# This file is loaded only for hosts in the pitaas_dev group (see inventory.yml).
+#
+# ★ For a new server (staging/prod), copy this file to pitaas_staging.yml
+# or pitaas_prod.yml, change the values below, add the host to inventory.yml,
+# and run playbooks/provision-pitaas-server.yml.
+
+env: dev
+
+# Public DNS apex for this env.
+# ★ apex = root domain; subdomains become <x>.<apex>.
+# Dev uses pitaas.rtcnexora.com (RTC Nexora's TLD).
+public_domain_apex: pitaas.rtcnexora.com
+
+# Server-side hostname (set during OS install; for inventory match).
+# Inventory should set ansible_host=<public_ip> for this host.
+server_hostname: HYRH-VPC339
+
+# Public IP (used in Traefik/LE config and DNS instructions).
+public_ip: 103.117.50.250
+
+# SSH port (vendor-managed: 4422 in dev; might be 22 in self-hosted).
+ssh_port: 4422
+
+# SSH user (the deployer; sudoer with NOPASSWD).
+ssh_user: pit_deploy_usr1
+
+# Public SSH key (lives at ~/.hermes/profiles/infra1/ssh/pitaas_dev_admin).
+ssh_key_path: /home/amd/.hermes/profiles/infra1/ssh/pitaas_dev_admin
+ssh_key_fingerprint_sha256: "SHA256:xuvdBeq31Y2IHDvaiwbG8qzXe37s5tFhLWgD/t/HucI"
+
+# Let's Encrypt email (per-env; LE sends renewal notices here).
+le_email: manandwifi@gmail.com
+
+# Frappe default site (created during provisioning).
+frappe_default_site: pitaas-v3-dev.local
+
+# Traefik dashboard basicauth (from `pass infra1/pitaas-v3/traefik-basicauth`).
+# Format: "admin:$2y$05$9j9iU5WyHmJWhuqPtewpzuefCcCWJLlNTS/jC2i2VLvMgYYa3yrHi"
+# (bcrypt hash, NOT the apr1 one — apr1 separators get eaten by compose ${VAR})
+# ★ This is rendered into docker/.env as HASHED_PASSWORD. The plain pwd
+# (also in pass) is only used to verify the hash locally.
+traefik_basicauth_hash: "$2y$05$9j9iU5WyHmJWhuqPtewpzuefCcCWJLlNTS/jC2i2VLvMgYYa3yrHi"
+
+# DNS provider for the public_domain_apex.
+# Currently wix (managed UI). Will move to porkbun or cloudflare when the
+# first paying customer aligns. The provisioning playbook does NOT touch
+# DNS — DNS A records must be added manually before LE certs can be issued.
+dns_provider: wix
+
+# ★ Provisioning marker: which features are enabled.
+# Used by provision-pitaas-server.yml to know which docker compose files to use.
+features:
+  traefik: true
+  le_certs: true
+  multi_bench: true
+  fe_bundles: true
+  pitaas_app: true
+  erpnext_app: true

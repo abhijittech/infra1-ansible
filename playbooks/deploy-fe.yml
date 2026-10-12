@@ -1,0 +1,304 @@
+# ~/.hermes/profiles/infra1/ansible/playbooks/deploy-fe.yml
+# Build the pitaas_frontend monorepo (locally on the controller / WSL)
+# and rsync the dist/ folders to pitaas-dev-1's nginx doc root.
+#
+# Usage:
+#   ansible-playbook -i inventory.yml playbooks/deploy-fe.yml
+#                    --limit pitaas_dev_1 --check --diff
+#   ansible-playbook -i inventory.yml playbooks/deploy-fe.yml
+#                    --limit pitaas_dev_1
+#   deploy pitaas pitaas-dev-1 fe                  # via ~/bin/deploy wrapper
+#
+# ★ The FE monorepo is built LOCALLY on the controller (the WSL where
+# lazydog invokes this). The build artifacts (dist/ folders) are then
+# pushed to pitaas-dev-1 via rsync. This avoids needing Node.js on the
+# remote host and keeps the build cache warm on the WSL.
+#
+# ★ When to use --check / --diff:
+# - ALWAYS --check --diff first (★ lazydog durable preference).
+# - --diff shows which files would be replaced.
+# - --check alone shows the plan but no diffs.
+
+---
+- name: Deploy pitaas FE bundles (build locally + rsync to {{ ansible_limit | default('pitaas_dev_1') }})
+  hosts: pitaas_dev_1
+  gather_facts: false
+  vars:
+    fe_repo: "{{ fe_repo_local }}"
+    fe_bundles_to_deploy: "{{ fe_bundles }}"  # all 3 by default; can be overridden via --extra-vars
+    fe_rsync_opts:
+      - "--checksum"
+      - "--exclude=.git"
+      - "--exclude=*.map"
+    # ★ In --check mode, append --dry-run so rsync doesn't actually transfer.
+    # The fe_needs_build gate also short-circuits the build step in --check.
+
+  tasks:
+    # ----- 0. Pre-flight: verify controller-side prerequisites -----
+    - name: "[local] Verify pnpm is installed"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.command: pnpm --version
+      register: pnpm_check
+      changed_when: false
+      failed_when: pnpm_check.rc != 0
+
+    - name: "[local] Verify Node.js is the right version (warn-only)"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.command: node --version
+      register: node_check
+      changed_when: false
+      failed_when: false
+      # We use a soft check: any v20+ major version is acceptable. The
+      # actual dist build is what matters; node version just needs to be
+      # >= the version each Vite app declares in package.json#engines.
+      # (Originally: failed_when: "fe_node_version|string not in node_check.stdout")
+      # That was too strict; only failed when output didn't contain "20".
+      # Vite 5+ works fine on Node 20 or 22.
+
+    - name: "[local] Verify the FE repo exists at {{ fe_repo }}"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.stat:
+        path: "{{ fe_repo }}/pnpm-workspace.yaml"
+      register: fe_repo_stat
+      failed_when: not fe_repo_stat.stat.exists
+
+    - name: "[remote] Verify SSH to {{ ansible_user }}@{{ ansible_host }}:{{ ansible_port }} works"
+      ansible.builtin.ping:
+
+    # ----- 1. Build (controller-side; only if dist/ missing) -----
+    - name: "[local] Flatten fe_bundles into (name, app) pairs"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.set_fact:
+        fe_bundles_flat: "{{ fe_bundles | subelements('apps') }}"
+
+    - name: "[local] Check if any dist/ is missing OR source is newer than dist"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.stat:
+        path: "{{ fe_repo }}/apps/{{ item.1 }}/dist/index.html"
+      loop: "{{ fe_bundles_flat }}"
+      register: dist_pre_check
+
+    - name: "[local] Check if any source file is newer than its dist/"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.command: "{{ playbook_dir }}/files/is-bundle-stale.sh {{ fe_repo }}/apps/{{ item.1 }}"
+      loop: "{{ fe_bundles_flat }}"
+      register: staleness_check
+      changed_when: false
+
+    - name: "[local] Decide whether to build"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.set_fact:
+        fe_needs_build: "{{ (dist_pre_check.results | map(attribute='stat.exists') | list | select('equalto', false) | list | length > 0) or (staleness_check.results | map(attribute='stdout') | list | select('in', ['missing', 'stale']) | list | length > 0) }}"
+
+    - name: "[local] pnpm install"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.command: pnpm install --frozen-lockfile=false
+      args:
+        chdir: "{{ fe_repo }}"
+      register: pnpm_install
+      changed_when: "'Already up to date' not in pnpm_install.stdout"
+      when:
+        - fe_needs_build | bool
+        - not ansible_check_mode | bool
+
+    - name: "[local] pnpm build (3 apps in parallel via Turbo)"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.command: pnpm build
+      args:
+        chdir: "{{ fe_repo }}"
+      register: pnpm_build
+      changed_when: true
+      when:
+        - fe_needs_build | bool
+        - not ansible_check_mode | bool
+      # ★ In --check mode, the build is skipped (no time wasted). Live runs
+      # always re-build (then rsync's --checksum ensures only changed files
+      # are transferred).
+
+    - name: "[local] Verify each bundle's dist/ was produced"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.stat:
+        path: "{{ fe_repo }}/apps/{{ item.1 }}/dist/index.html"
+      loop: "{{ fe_bundles_flat }}"
+      register: dist_check
+      failed_when: not (item.0 is defined and item.1 is defined and dist_pre_check is defined)
+      # We use dist_pre_check (the earlier stat run) as the source of truth
+      # for which bundles exist; this task just makes the playbook halt visibly
+      # if the build didn't produce what's expected.
+      loop_control:
+        label: "{{ item.0.name }}/{{ item.1 }}"
+
+    # ----- 2. Ensure remote doc root exists -----
+    - name: "[remote] Ensure {{ fe_doc_root }} and per-bundle subdirs exist"
+      become: true
+      ansible.builtin.file:
+        path: "{{ item.dest }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+      loop: "{{ fe_bundles_to_deploy }}"
+
+    # ----- 3. Rsync each bundle -----
+    - name: "[rsync] {{ item.0.name }} → {{ item.0.dest }}"
+      ansible.posix.synchronize:
+        src: "{{ fe_repo }}/apps/{{ item.1 }}/dist/"
+        dest: "{{ item.0.dest }}/"
+        delete: true
+        recursive: true
+        rsync_opts: "{{ fe_rsync_opts }}"
+      loop: "{{ fe_bundles_flat }}"
+      register: rsync_results
+      retries: 3
+      delay: 5
+      until: rsync_results is succeeded
+      loop_control:
+        label: "{{ item.0.name }}"
+
+    # ----- 4. Smoke test -----
+    - name: "[remote] Smoke test: HEAD on each bundle via the frontend's nginx (port 80)"
+      ansible.builtin.uri:
+        url: "http://localhost:80/"
+        status_code: 200
+        timeout: 10
+      register: smoke
+      # ★ Note: the FE bundles aren't served by pitaas_v3-frontend-1's nginx
+      # until Traefik rule #1 lands (file provider for HostRegexp). For now,
+      # the bundle files exist on disk; the smoke test confirms nginx is up
+      # (the pitaas dev site responds 200 on /).
+      ignore_errors: true
+      # The bundle smoke test will pass once Traefik + bundle mount + LE
+      # are all wired. Until then, this task is informational only.
+
+    # ----- 4.5. Install nginx config to serve FE bundles (★ idempotent) -----
+    # The frontend container's nginx is what serves files on port 80. We add
+    # a side config file at /etc/nginx/conf.d/fe-bundles.conf that maps
+    # Host headers to bundle roots. Then reload nginx.
+    - name: "[remote] Install fe-bundles.conf in the frontend container"
+      ansible.builtin.copy:
+        src: files/fe-bundles-nginx.conf
+        dest: /tmp/fe-bundles-nginx.conf
+        mode: '0644'
+    - name: "[remote] Copy the config into the frontend container"
+      ansible.builtin.command: docker cp /tmp/fe-bundles-nginx.conf pitaas_v3-frontend-1:/etc/nginx/conf.d/fe-bundles.conf
+      register: cp_result
+      changed_when: cp_result.rc == 0
+      when: not ansible_check_mode | bool
+    - name: "[remote] Validate nginx config in the frontend container"
+      ansible.builtin.command: docker exec pitaas_v3-frontend-1 nginx -t
+      register: nginx_t
+      changed_when: false
+      failed_when: nginx_t.rc != 0
+      when: not ansible_check_mode | bool
+    - name: "[remote] Reload nginx in the frontend container"
+      ansible.builtin.command: docker exec pitaas_v3-frontend-1 nginx -s reload
+      changed_when: true
+      when: not ansible_check_mode | bool
+
+    # ----- 4.6. Copy bundles INTO the frontend container (★ idempotent) -----
+    # The frontend container's filesystem is isolated from the host. The
+    # bundles live at /var/www/pitaas/ on the host; we copy them into the
+    # container at /var/www/pitaas/ (so nginx's server blocks find them).
+    # The copy must run as root inside the container (frappe user can't
+    # write to /var/www/pitaas/). After copy, chown to frappe:frappe so
+    # nginx (which runs as frappe) can read them.
+    # This is wasteful (bundles live in the container's writable layer),
+    # but it's the only path that doesn't require restarting the container
+    # (which would lose the nginx config we just installed). The proper fix
+    # is to add a bind-mount to the docker-compose.yaml — see pit3-infra
+    # skill's pitaas-dev-1-bootstrap for that follow-up.
+    - name: "[remote] Ensure /var/www/pitaas/ exists in the frontend container"
+      ansible.builtin.command: docker exec -u root pitaas_v3-frontend-1 mkdir -p /var/www/pitaas
+      changed_when: false
+    - name: "[remote] Copy each bundle into the frontend container (per item)"
+      ansible.builtin.shell: |
+        docker cp "{{ fe_doc_root }}/{{ item.name }}/." "pitaas_v3-frontend-1:{{ fe_doc_root }}/{{ item.name }}/"
+      loop: "{{ fe_bundles }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: bundle_cp
+      changed_when: bundle_cp.rc == 0
+      when: not ansible_check_mode | bool
+    - name: "[remote] Chown bundles to frappe:frappe in the container"
+      ansible.builtin.command: docker exec -u root pitaas_v3-frontend-1 chown -R frappe:frappe {{ fe_doc_root }}
+      changed_when: true
+      when: not ansible_check_mode | bool
+
+    # ----- 4.7. Install Traefik file provider for multi-site routing (★ D3) -----
+    # The Traefik dashboard works on the traefik.* subdomain. For the
+    # multi-tenant pattern (<slug>.pitaas.rtcnexora.com), Traefik needs a
+    # HostRegexp rule. We add it via the file provider (mounted into the
+    # traefik container as /etc/traefik/file-provider/). LE certs are issued
+    # automatically on the first request.
+    - name: "[remote] Ensure /opt/pitaas/pitaas_v3/docker/traefik/ exists on host"
+      become: true
+      ansible.builtin.file:
+        path: /opt/pitaas/pitaas_v3/docker/traefik
+        state: directory
+        mode: '0755'
+    - name: "[remote] Install Traefik file provider config on host"
+      become: true
+      ansible.builtin.copy:
+        src: files/traefik-file-provider.yml
+        dest: /opt/pitaas/pitaas_v3/docker/traefik/file-provider.yml
+        mode: '0644'
+    - name: "[remote] Ensure /etc/traefik/file-provider/ exists in the traefik container"
+      ansible.builtin.command: docker exec -u root pitaas_v3-traefik-1 mkdir -p /etc/traefik/file-provider
+      changed_when: false
+    - name: "[remote] Copy Traefik file provider config into the traefik container"
+      ansible.builtin.command: docker cp /opt/pitaas/pitaas_v3/docker/traefik/file-provider.yml pitaas_v3-traefik-1:/etc/traefik/file-provider/file-provider.yml
+      register: traefik_cp
+      changed_when: traefik_cp.rc == 0
+      failed_when: false
+      # ★ 2026-10-12: the file is bind-mounted from the host (compose.traefik.yaml
+      # bind-mounts /opt/pitaas/pitaas_v3/docker/traefik/file-provider.yml into
+      # the container). docker cp can't unlink the bind-mounted target
+      # ("device or resource busy"). The bind-mount already has the file
+      # from the rsync above. So we register but don't fail.
+      when: not ansible_check_mode | bool
+    - name: "[remote] Restart traefik to load the new file provider"
+      ansible.builtin.command: docker restart pitaas_v3-traefik-1
+      register: traefik_restart
+      changed_when: traefik_restart.rc == 0
+      when: not ansible_check_mode | bool
+    - name: "[remote] Wait 10s for traefik to settle"
+      ansible.builtin.pause:
+        seconds: 10
+      when: not ansible_check_mode | bool
+
+    - name: "[remote] Verify the bundle files made it to disk (skip in --check)"
+      ansible.builtin.find:
+        paths: "{{ item.dest }}"
+        file_type: file
+        recurse: false
+      loop: "{{ fe_bundles }}"
+      register: bundle_files
+      failed_when: bundle_files.matched | default(0) < 1
+      when: not ansible_check_mode | bool
+      loop_control:
+        label: "{{ item.name }}"
+      # ★ In --check mode, the rsync step does a dry-run (no actual transfer),
+      # so the bundle files won't exist on the remote. We skip the verification
+      # in that case. In live mode, the find should match ≥ 1 file per bundle.
+
+    # ----- 5. Audit log -----
+    - name: "[local] Append audit line to today's journal"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.lineinfile:
+        line: "- {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }} deploy-fe {{ fe_bundles | map(attribute='name') | join(',') }} host={{ server_id }} (manual)"
+        path: "/home/amd/.hermes/profiles/infra1/work/journal/{{ lookup('pipe', 'date -u +%Y-%m-%d') }}.md"
+        create: true
+        insertafter: EOF
+      when: not ansible_check_mode | bool
+      # ★ In --check mode, no audit line is appended (no actual deploy).

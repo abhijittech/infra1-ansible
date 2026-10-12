@@ -1,0 +1,128 @@
+---
+# ~/.hermes/profiles/infra1/ansible/playbooks/refresh-nginx.yml
+#
+# ★ Re-render fe-bundles-nginx.conf and traefik-file-provider.yml from
+# group_vars/pitaas.yml, rsync to the remote, and reload nginx + traefik.
+#
+# Use this when you:
+#   - Add/remove a customer in nginx_per_host
+#   - Change the public_domain_apex
+#   - Add a new URL-hygiene rewrite
+#   - Want to refresh certs / change cert domains
+#   - Change nginx_cors_allowed_origins (drives FE nginx + Frappe allow_cors;
+#                                       deploy-be.yml is separately responsible
+#                                       for the Frappe allow_cors write)
+#
+# Usage:
+#   deploy pitaas pitaas-dev-1 refresh
+#   ansible-playbook -i inventory.yml playbooks/refresh-nginx.yml --limit pitaas_dev_1
+- name: "RE-RENDER fe-bundles-nginx.conf + traefik-file-provider.yml from group_vars"
+  hosts: "{{ target_group | default('pitaas_dev') }}"
+  become: true
+  gather_facts: true
+  vars:
+    # ★ Rendered output goes to the local infra1 scratch dir, NOT inside the BE
+    # repo. Writing inside ~/projects/pitaas_v3/ requires sudo and pollutes the
+    # source tree with generated artifacts. Scratch dir is auto-created by
+    # the delegate_to: localhost tasks below.
+    rendered_dir_local: "{{ playbook_dir }}/../../cache/scratch/refresh-nginx"
+  tasks:
+
+    - name: "[local] ensure rendered dir exists ({{ rendered_dir_local }})"
+      ansible.builtin.file:
+        path: "{{ rendered_dir_local }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: "render traefik-file-provider.yml from nginx_per_host"
+      template:
+        src: traefik-file-provider.yml.j2
+        dest: "{{ rendered_dir_local }}/traefik-file-provider.yml.rendered"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: "render fe-bundles-nginx.conf from nginx_per_host"
+      template:
+        src: fe-bundles-nginx.conf.j2
+        dest: "{{ rendered_dir_local }}/fe-bundles-nginx.conf.rendered"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: "chown docker/traefik/ to pit_deploy_usr1 (rsync needs write)"
+      ansible.builtin.command: chown -R pit_deploy_usr1:pit_deploy_usr1 "{{ be_repo_remote }}/docker/traefik"
+      changed_when: false
+      # ★ /opt/pitaas/pitaas_v3/docker/traefik/ is owned by root:root (set
+      # by the original docker-compose init on the vendor image, not by
+      # our deploy-be playbook). pit_deploy_usr1 can't write to it even via
+      # sudo because the parent dir's perms block it. chown to pit_deploy_usr1
+      # first so rsync can write. Idempotent: chown is a no-op if perms are
+      # already correct, and we WANT them to stay pit_deploy_usr1 after this
+      # so future rsyncs work. (★ same chown pattern as deploy-be.yml's
+      # apps/pitaas chown step.)
+
+    - name: "rsync rendered traefik file provider to remote"
+      ansible.posix.synchronize:
+        src: "{{ rendered_dir_local }}/traefik-file-provider.yml.rendered"
+        dest: "{{ be_repo_remote }}/docker/traefik/file-provider.yml"
+      delegate_to: localhost
+      become: false
+
+    - name: "rsync rendered nginx conf to remote /tmp"
+      ansible.posix.synchronize:
+        src: "{{ rendered_dir_local }}/fe-bundles-nginx.conf.rendered"
+        dest: "/tmp/fe-bundles-nginx.conf.rendered"
+      delegate_to: localhost
+      become: false
+
+    - name: "copy fe-bundles-nginx.conf into frontend container + reload"
+      ansible.builtin.shell: |
+        sudo -n docker cp /tmp/fe-bundles-nginx.conf.rendered pitaas_v3-frontend-1:/etc/nginx/conf.d/fe-bundles.conf
+        sudo -n docker exec pitaas_v3-frontend-1 nginx -t 2>&1
+        sudo -n docker exec pitaas_v3-frontend-1 nginx -s reload 2>&1
+      register: nginx_reload
+      changed_when: "'signal process started' in nginx_reload.stderr"
+      # ★ BUGFIX: previously used /tmp/fe-bundles-nginx.conf (a stale file,
+      # not the rendered one). The refresh-nginx playbook rsyncs the
+      # rendered file to /tmp/fe-bundles-nginx.conf.rendered; the docker cp
+      # must use the .rendered suffix. Without this fix, the rendered
+      # fe-bundles.conf was never actually deployed — the stale old version
+      # stayed in the container, which is what produced the CORS-2026-10-12
+      # regression where the new template changes (e.g. removal of the
+      # `Access-Control-Allow-Origin *` line) didn't take effect.
+
+    - name: "restart traefik to pick up the new file provider"
+      community.docker.docker_compose_v2:
+        project_src: "{{ be_repo_remote }}"
+        env_files:
+          - "{{ be_repo_remote }}/docker/.env"
+        files: "{{ be_compose_files | map('regex_replace', '^(.*)$', be_repo_remote ~ '/\\1') | list }}"
+        services: [traefik]
+        state: present
+        recreate: always
+      register: traefik_restart
+
+    - name: "summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          ★ REFRESH COMPLETE for {{ inventory_hostname }}
+          ============================================================
+          Per-host blocks rendered for:
+          {% for host in nginx_per_host %}
+            {{ host.subdomain }}.{{ public_domain_apex }}  →  {{ host.bundle }}  →  {{ host.frappe_site }}.local  [le_cert={{ host.le_cert }}]
+          {% endfor %}
+          ★ If a new customer was added, they should hit their URL
+          in a browser to trigger the LE cert (or wait for the
+          cron / first TLS handshake to do it).
+          ★ CORS (group_vars/pitaas.yml:nginx_cors_allowed_origins) was
+          applied to the nginx layer (Allow-Origin header removed from the
+          template; Frappe's set_cors_headers echoes the request Origin
+          from its allow_cors config).
+          ============================================================

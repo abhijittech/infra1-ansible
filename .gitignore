@@ -1,0 +1,29 @@
+# ★ infra1-ansible gitignore
+# Per-project secrets live in infra1/<server_id>/ (e.g. infra1/pitaas-dev-1/mariadb-root).
+# NEVER commit those files; they're per-host passwords.
+infra1/*/mariadb-root
+infra1/*/mariadb-password
+infra1/*/db-password
+infra1/*/encryption-key
+infra1/*/seed-admin-password
+infra1/*/*password*
+infra1/*/*secret*
+infra1/*/*.key
+infra1/*/*.pem
+infra1/*/known_hosts
+
+# Rendered artifacts (the refresh-nginx playbook writes to cache/scratch/ — generated, not source)
+cache/
+scratch/
+*.rendered
+
+# Ansible control artifacts
+*.retry
+.ansible/
+*.pyc
+__pycache__/
+
+# OS / editor
+.DS_Store
+*.swp
+*~

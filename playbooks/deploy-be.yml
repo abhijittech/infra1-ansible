@@ -1,0 +1,308 @@
+# ~/.hermes/profiles/infra1/ansible/playbooks/deploy-be.yml
+# rsync the pitaas_v3 backend repo to pitaas-dev-1, restart the docker
+# compose stack, and run per-site Frappe migrations.
+#
+# Usage:
+#   ansible-playbook -i inventory.yml playbooks/deploy-be.yml
+#                    --limit pitaas_dev_1 --check --diff
+#   ansible-playbook -i inventory.yml playbooks/deploy-be.yml
+#                    --limit pitaas_dev_1
+#   deploy pitaas pitaas-dev-1 be                  # via ~/bin/deploy wrapper
+#
+# ★ CRITICAL: BE deploys touch the database. ALWAYS pre-backup before
+# docker compose up. The playbook will warn-and-skip if the backup
+# script is missing; the operator must install it (Q6 in pitaas-architecture-INDEX)
+# before relying on this for production.
+#
+# ★ What this playbook does NOT do:
+# - It does NOT touch the configurator, traefik, mariadb, redis services.
+#   They're stable across deploys; restarting them is unnecessary risk.
+# - It does NOT install Python packages directly; the bench's venv is
+#   recreated only when the Python requirements change (rare; out of scope
+#   for the standard BE deploy).
+# - It does NOT push Frappe migration patches; `bench --site <site> migrate`
+#   is the canonical migration trigger.
+
+---
+- name: Deploy pitaas BE (rsync + restart services + migrate) to {{ server_id }}
+  hosts: pitaas_dev_1
+  gather_facts: false
+  vars:
+    be_repo: "{{ be_repo_local }}"
+    be_remote: "{{ be_repo_remote }}"
+    be_sites_to_migrate: "{{ be_sites }}"
+    be_services: "{{ be_services_to_restart }}"
+
+  tasks:
+    # ----- 0. Pre-flight -----
+    - name: "[local] Verify the BE repo exists at {{ be_repo }}"
+      delegate_to: localhost
+      ansible.builtin.stat:
+        path: "{{ be_repo }}/apps/pitaas"
+      register: be_repo_stat
+      failed_when: not be_repo_stat.stat.exists
+
+    - name: "[remote] Verify SSH to {{ ansible_user }}@{{ ansible_host }}:{{ ansible_port }}"
+      ansible.builtin.ping:
+
+    - name: "[remote] Verify the remote BE repo path exists ({{ be_remote }})"
+      ansible.builtin.stat:
+        path: "{{ be_remote }}"
+      register: be_remote_stat
+      failed_when: not be_remote_stat.stat.exists
+      # First-time deploys need /opt/pitaas/pitaas_v3 to exist on the remote.
+      # If not, the operator should ssh + sudo mkdir + chown manually first.
+
+    # ----- 1. Pre-deploy backup (★ always) -----
+    - name: "[remote] Check if backup script exists at {{ be_backup_script }}"
+      ansible.builtin.stat:
+        path: "{{ be_backup_script }}"
+      register: backup_script_stat
+
+    - name: "[remote] Pre-deploy backup"
+      become: true
+      ansible.builtin.command: "{{ be_backup_script }}"
+      when: backup_script_stat.stat.exists | default(false)
+      register: backup_result
+      changed_when: backup_result.rc == 0
+      failed_when: backup_result.rc != 0
+
+    - name: "[remote] WARN: no backup script found (skipping pre-deploy backup)"
+      ansible.builtin.debug:
+        msg: |
+          ★ WARNING: {{ be_backup_script }} not found on {{ server_id }}.
+          Pre-deploy backup is SKIPPED. This is acceptable for dev but
+          must be installed before relying on this for production.
+          See obsidian/memory/infra1/pitaas-architecture-INDEX.md Q6.
+      when: not (backup_script_stat.stat.exists | default(false))
+
+    # ----- 1.5. Render .env from pass secrets + template (★ idempotent) -----
+    # The .env file lives at /opt/pitaas/pitaas_v3/docker/.env. It's gitignored
+    # and contains per-host secrets (HASHED_PASSWORD, DB_PASSWORD). Lazydog
+    # manages these via `pass` on the WSL controller; Ansible renders the
+    # .env from the template + secrets at deploy time. No manual .env editing.
+    - name: "[local] Load secrets from pass (★ community.general.passwordstore)"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.set_fact:
+        be_db_password: "{{ lookup('community.general.passwordstore', 'infra1/' + (inventory_hostname | replace('_', '-')) + '/mariadb-root') }}"
+        be_traefik_basicauth: "{{ lookup('community.general.passwordstore', 'infra1/' + (inventory_hostname | replace('_', '-')) + '/traefik-basicauth') }}"
+      no_log: true    # ★ don't log the actual secrets
+      # `inventory_hostname` returns e.g. `pitaas_dev_1` (Ansible convention).
+      # The pass path uses kebab-case: `infra1/pitaas-dev-1/mariadb-root`.
+      # The `replace('_', '-')` filter handles the conversion.
+
+    - name: "[remote] Render .env from template + pass secrets"
+      ansible.builtin.template:
+        src: docker.env.j2
+        dest: "{{ be_remote }}/docker/.env"
+        mode: '0600'
+      become: true
+      # ★ /opt/pitaas/pitaas_v3/docker/ is su:su owned (from the docker
+      # container's UID map). become defaults to root, which CAN write there.
+      # The .env ends up owned by root; downstream tasks (docker compose up)
+      # run as pit_deploy_usr1 and read the file via the bind mount.
+      vars:
+        db_password: "{{ be_db_password }}"
+        traefik_basicauth: "{{ be_traefik_basicauth }}"
+        router: "{{ be_router | default('pitaas_v3-dev') }}"
+        letsencrypt_email: "manandwifi@gmail.com"
+        frappe_site_name_header: "pitaas-v3-dev.local"
+        db_data_location: /opt/pitaas/pitaas_v3/data/db
+        sites_data_location: /opt/pitaas/pitaas_v3/data/sites
+        redis_queue_data_location: /opt/pitaas/pitaas_v3/data/redis-queue
+        bench_network: "{{ be_router | default('pitaas_v3-dev') }}"
+      when: not ansible_check_mode | bool
+
+    - name: "[remote] Verify .env has all required vars"
+      ansible.builtin.shell: |
+        set -e
+        missing=""
+        for v in HASHED_PASSWORD SITES_RULE ROUTER LETSENCRYPT_EMAIL TRAEFIK_DOMAIN EMAIL DB_DATA_LOCATION SITES_DATA_LOCATION REDIS_QUEUE_DATA_LOCATION BENCH_NETWORK; do
+          if ! grep -q "^${v}=" {{ be_remote }}/docker/.env; then
+            missing="${missing} ${v}"
+          fi
+        done
+        if [ -n "$missing" ]; then
+          echo "MISSING: $missing" >&2
+          exit 1
+        fi
+        echo "OK"
+      register: be_env_check
+      changed_when: false
+      failed_when: be_env_check.rc != 0
+      when: not ansible_check_mode | bool
+
+    # ----- 2. Rsync the BE repo -----
+    - name: "[rsync] {{ be_repo }} → {{ ansible_user }}@{{ ansible_host }}:{{ be_remote }}"
+      ansible.posix.synchronize:
+        src: "{{ be_repo }}/"
+        dest: "{{ be_remote }}/"
+        delete: false          # ★ safer for BE: don't delete remote-only files (vendor may have overlays)
+        recursive: true
+        rsync_opts: >-
+          --checksum
+          {{ common_rsync_excludes | map('regex_replace', '^(.*)$', '--exclude=\1') | join(' ') }}
+      become: true
+      become_user: root
+      register: be_rsync_result
+      retries: 3
+      delay: 5
+      until: be_rsync_result is succeeded
+      # ★ become: true is required because the apps/pitaas/ subdirectory is
+      # owned by the docker container's `frappe` user (mapped to host UID
+      # `su`), not pit_deploy_usr1. Without become, rsync can't write
+      # to those paths. Sudo -n is configured (NOPASSWD) for pit_deploy_usr1.
+
+    # ----- 2.5. Fix ownership (★ docker creates files as in-container UID) -----
+    - name: "[remote] chown apps/pitaas back to pit_deploy_usr1 (docker bind-mount can re-set)
+              (set to 1001:1001 to match pit_deploy_usr1; the docker container's
+              `frappe` user is in-container UID 1001 only if uid:gid are aligned — verify
+              with `docker exec pitaas_v3-backend-1 id frappe`.)"
+      become: true
+      ansible.builtin.command: chown -R pit_deploy_usr1:pit_deploy_usr1 "{{ be_remote }}/apps/pitaas"
+      register: chown_result
+      changed_when: chown_result.rc == 0
+      failed_when: chown_result.rc != 0
+      when: not ansible_check_mode | bool
+
+    # ----- 2.6. Reconnect db container to mariadb-network with `db` alias (★ idempotent) -----
+    # ★ The multi-bench overlay expects a `mariadb-network` external network
+    # with the db container connected to it and the alias `db`. When `docker
+    # compose up` runs, it doesn't manage the network connectivity — only the
+    # service definitions. The bind-mount / chown dance on file mode 2.5
+    # ensures the .env + apps/pitaas are accessible, but the network is a
+    # runtime concern. We re-attach the network idempotently here so every
+    # BE deploy leaves the network in a known state.
+    #
+    # The probe script lives in playbooks/files/db-network-probe.sh (avoids
+    # the Go template `{{ }}` and Jinja2 `{{ }}` collisions if we inlined it).
+    - name: "[remote] Copy db-network-probe.sh to the host"
+      ansible.builtin.copy:
+        src: files/db-network-probe.sh
+        dest: /tmp/db-network-probe.sh
+        mode: '0755'
+    - name: "[remote] Probe pitaas_v3-db-1 networks + aliases"
+      ansible.builtin.command: /tmp/db-network-probe.sh
+      register: db_probe
+      changed_when: false
+    - name: "[remote] Parse probe output (networks on first N lines, alias on last)"
+      ansible.builtin.set_fact:
+        db_networks: "{{ db_probe.stdout_lines[0:-1] | select | list }}"
+        db_aliases: "{{ db_probe.stdout_lines[-1] | default('') }}"
+    - name: "[remote] Connect pitaas_v3-db-1 to mariadb-network (if not already)"
+      ansible.builtin.command: docker network connect --alias db mariadb-network pitaas_v3-db-1
+      when: "'mariadb-network' not in db_networks"
+      register: db_connect
+      changed_when: db_connect.rc == 0
+    - name: "[remote] Ensure 'db' alias is present on mariadb-network"
+      ansible.builtin.shell: |
+        if ! echo "{{ db_aliases }}" | grep -qw db; then
+          docker network disconnect --force mariadb-network pitaas_v3-db-1
+          docker network connect --alias db mariadb-network pitaas_v3-db-1
+          echo "reconnected with --alias db"
+        else
+          echo "alias db already present"
+        fi
+      register: db_alias_fix
+      changed_when: "'reconnected' in db_alias_fix.stdout"
+      when: not ansible_check_mode | bool
+
+    # ----- 2.7. Re-grant per-site MariaDB users with wildcard (★ defensive) -----
+    # ★ When the db container gets a new IP (after a docker compose up, after
+    # a restart, or after a network reconnect), the per-site user grants
+    # tied to the OLD IP can fail. We read each site's site_config.json
+    # and apply a wildcard grant for that user, idempotently.
+    - name: "[remote] Re-grant per-site MariaDB users with wildcard (defensive)"
+      become: true
+      ansible.builtin.shell: |
+        set -e
+        for site in {{ be_sites | join(' ') }}; do
+          site_cfg="/home/frappe/frappe-bench/sites/$site/site_config.json"
+          if [ ! -f "$site_cfg" ]; then continue; fi
+          db_user=$(python3 -c "import json; print(json.load(open('$site_cfg')).get('db_user',''))")
+          db_pass=$(python3 -c "import json; print(json.load(open('$site_cfg')).get('db_password',''))")
+          db_name=$(python3 -c "import json; print(json.load(open('$site_cfg')).get('db_name',''))")
+          if [ -z "$db_user" ] || [ -z "$db_pass" ] || [ -z "$db_name" ]; then continue; fi
+          docker exec pitaas_v3-db-1 bash -lc "mariadb -uroot -p{{ be_db_password }} -e \
+            \"CREATE USER IF NOT EXISTS '$db_user'@'%' IDENTIFIED BY '$db_pass'; \
+             GRANT ALL ON \`$db_name\`.* TO '$db_user'@'%'; \
+             FLUSH PRIVILEGES;\""
+          echo "  ✓ $site: granted $db_user@'%'"
+        done
+      register: regrant
+      changed_when: false   # ★ Always a no-op once granted; do not trigger "changed" for idempotency
+      when: not ansible_check_mode | bool
+
+    # ----- 3. Restart services (configurator/traefik/mariadb/redis NOT touched) -----
+    - name: "[remote] Build the docker compose command line"
+      ansible.builtin.set_fact:
+        be_compose_cmd: "docker compose --env-file docker/.env -p {{ be_compose_project }}"
+        be_compose_cmd_full: >-
+          docker compose --env-file docker/.env -p {{ be_compose_project }}
+          {% for f in be_compose_files %}-f {{ f }} {% endfor %}
+
+    - name: "[remote] docker compose up -d --build for {{ be_services | join(', ') }}"
+      ansible.builtin.command: >
+        {{ be_compose_cmd_full }} up -d --build {{ be_services | join(' ') }}
+      args:
+        chdir: "{{ be_remote }}"
+      register: be_compose_up
+      changed_when: "'Creating' in be_compose_up.stdout or 'Recreating' in be_compose_up.stdout or 'Starting' in be_compose_up.stdout"
+      when: not ansible_check_mode | bool
+      # ★ In --check mode, the up is skipped (would consume time and trigger
+      # a real build). Live mode always restarts the listed services.
+
+    - name: "[remote] Show docker compose up output (last 30 lines)"
+      ansible.builtin.debug:
+        msg: "{{ be_compose_up.stdout_lines[-30:] }}"
+      when:
+        - be_compose_up is defined
+        - be_compose_up.stdout_lines is defined
+
+    # ----- 4. Per-site migrate -----
+    - name: "[remote] bench --site {{ item }} migrate"
+      ansible.builtin.command: >
+        docker exec pitaas_v3-backend-1 bash -lc
+        "cd /home/frappe/frappe-bench && bench --site {{ item }} migrate"
+      register: be_migrate
+      changed_when: false
+      loop: "{{ be_sites_to_migrate }}"
+      loop_control:
+        label: "{{ item }}"
+      failed_when:
+        - be_migrate.rc != 0
+        - not ansible_check_mode | bool
+      # In --check mode, docker exec may not even be run; the failed_when
+      # is suppressed so the playbook reports a clean dry-run.
+      when: not ansible_check_mode | bool
+      # Per-site failure is critical; the playbook halts here so the operator
+      # can investigate before deploying to the next site.
+
+    # ----- 5. Smoke test: per-site ping -----
+    - name: "[remote] Smoke test: frappe.ping on {{ item }}"
+      ansible.builtin.command: >
+        docker exec pitaas_v3-backend-1 bash -lc
+        "cd /home/frappe/frappe-bench && bench --site {{ item }} execute frappe.ping"
+      register: be_ping
+      changed_when: false
+      loop: "{{ be_sites_to_migrate }}"
+      loop_control:
+        label: "{{ item }}"
+      failed_when:
+        - be_ping.rc != 0
+        - not ansible_check_mode | bool
+      # Pings the Frappe site; if it returns 'pong', the bench + DB are healthy.
+      when: not ansible_check_mode | bool
+
+    # ----- 6. Audit log -----
+    - name: "[local] Append audit line to today's journal"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.lineinfile:
+        line: "- {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }} deploy-be sites={{ be_sites_to_migrate | join(',') }} host={{ server_id }} (manual)"
+        path: "/home/amd/.hermes/profiles/infra1/work/journal/{{ lookup('pipe', 'date -u +%Y-%m-%d') }}.md"
+        create: true
+        insertafter: EOF
+      when: not ansible_check_mode | bool
+      # ★ In --check mode, no audit line is appended (no actual deploy).

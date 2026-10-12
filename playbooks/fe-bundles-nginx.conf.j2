@@ -1,0 +1,184 @@
+# pitaas_v3-frontend-1: serve FE static bundles (★ templated, do not hand-edit)
+# Source of truth: ansible/group_vars/pitaas.yml → nginx_per_host list.
+# ★ To add a customer: edit group_vars/pitaas.yml and run add-customer.yml.
+#
+# Architecture (per-host multi-tenant):
+#   1. Traefik routes <slug>.<apex> → this nginx (port 8080) on the docker network
+#   2. This nginx dispatches by Host to the right per-host server block
+#   3. Each per-host block serves the Vite-built bundle from /var/www/pitaas/<bundle>-app/
+#   4. Each per-host block proxies /api/* to the backend with X-Frappe-Site-Name
+#      set to the matching Frappe site (apex.v3.local, pitaas-v3-dev.local, etc.)
+#   5. The /api/ paths are URL-hygiene rewrites (Q-AUTH9): /api/login maps
+#      to /api/method/pitaas.api.auth.login, etc.
+#
+# Source of the rewrite rules (canonical):
+#   /home/amd/projects/pitaas_v3/docker/resources/core/nginx/nginx-template.conf
+# (We hand-port the rules per-host, replacing the hardcoded site name
+# with the per-host frappe_site from the nginx_per_host list.)
+
+# ============================================================================
+# Server: catch-all (default_server) — serves customer-app for unknown hosts
+# ============================================================================
+server {
+    listen 8080 default_server;
+    server_name _;
+
+    root /var/www/pitaas/customer-app;
+    index index.html;
+
+    # NOTE: Access-Control-Allow-Origin is NOT set here; Frappe's CORS
+    # middleware (apps/frappe/frappe/app.py:set_cors_headers) reads
+    # frappe.conf.allow_cors and echoes the request Origin (when in the list)
+    # with Access-Control-Allow-Credentials: true. nginx `add_header *` would
+    # produce TWO Allow-Origin headers (`*` + echoed origin), and browsers
+    # (per CORS spec) reject `*` + credentials — see pit3-bug-handover-from-infra
+    # CORS-2026-10-12 root cause.
+    add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+    add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
+
+    location /api/ {
+        proxy_pass http://backend:8000;
+        proxy_set_header Host pitaas-v3-dev.local;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_redirect off;
+    }
+
+    location /assets/ {
+        try_files $uri =404;
+        access_log off;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
+
+# ============================================================================
+# Per-Host server blocks (one per nginx_per_host entry)
+# ============================================================================
+{% for host in nginx_per_host %}
+server {
+    listen 8080;
+    server_name {{ host.subdomain }}.{{ public_domain_apex }};
+
+    root /var/www/pitaas/{{ host.bundle }};
+    index index.html;
+
+    # NOTE: Access-Control-Allow-Origin is NOT set here; see comment in the
+    # catch-all server block above. Frappe echoes the Origin from its
+    # `allow_cors` config (driven by `nginx_cors_allowed_origins` in
+    # group_vars/pitaas.yml via the Frappe ansible pass-template path; the
+    # Frappe side is configured separately by the BE ansible deploy).
+    add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+    add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
+
+    # ----- URL-hygiene rewrites (Q-AUTH9) -----
+    # /api/login → /api/method/pitaas.api.auth.login
+    location = /api/login {
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Frappe-Site-Name {{ host.frappe_site }}.local;
+        proxy_set_header Host $host;
+        proxy_pass http://backend:8000/api/method/pitaas.api.auth.login;
+    }
+
+    location = /api/logout {
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Frappe-Site-Name {{ host.frappe_site }}.local;
+        proxy_set_header Host $host;
+        proxy_pass http://backend:8000/api/method/pitaas.api.auth.logout;
+    }
+
+    location = /api/me {
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Frappe-Site-Name {{ host.frappe_site }}.local;
+        proxy_set_header Host $host;
+        proxy_pass http://backend:8000/api/method/pitaas.api.auth.whoami;
+    }
+
+    location = /api/auth/forgot-password {
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Frappe-Site-Name {{ host.frappe_site }}.local;
+        proxy_set_header Host $host;
+        proxy_pass http://backend:8000/api/method/pitaas.api.auth.forgot_password;
+    }
+
+    location = /api/auth/reset-password {
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Frappe-Site-Name {{ host.frappe_site }}.local;
+        proxy_set_header Host $host;
+        proxy_pass http://backend:8000/api/method/pitaas.api.auth.reset_password;
+    }
+
+    location = /api/auth/change-password {
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Frappe-Site-Name {{ host.frappe_site }}.local;
+        proxy_set_header Host $host;
+        proxy_pass http://backend:8000/api/method/pitaas.api.auth.change_password;
+    }
+
+    location = /api/dashboard/customer-home {
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Frappe-Site-Name {{ host.frappe_site }}.local;
+        proxy_set_header Host $host;
+        proxy_pass http://backend:8000/api/method/pitaas.api.dashboard.get_customer_home_clean;
+    }
+
+    location = /api/dashboard/inventory-home {
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Frappe-Site-Name {{ host.frappe_site }}.local;
+        proxy_set_header Host $host;
+        proxy_pass http://backend:8000/api/method/pitaas.api.dashboard.get_inventory_dashboard_clean;
+    }
+
+    location = /api/items {
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Frappe-Site-Name {{ host.frappe_site }}.local;
+        proxy_set_header Host $host;
+        proxy_pass http://backend:8000/api/method/pitaas.api.item.list_items_clean;
+    }
+
+    # ----- Generic /api/ catch-all (for pitaas.api.* and frappe.* endpoints) -----
+    location /api/ {
+        proxy_pass http://backend:8000;
+        proxy_set_header Host {{ host.frappe_site }}.local;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_redirect off;
+    }
+
+    location /assets/ {
+        try_files $uri =404;
+        access_log off;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
+
+{% endfor %}

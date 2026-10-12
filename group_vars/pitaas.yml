@@ -1,0 +1,161 @@
+# ~/.hermes/profiles/infra1/ansible/group_vars/pitaas.yml
+# Project-level vars for pitaas. Applies to ALL pitaas_<env> groups.
+# Per-env overrides go in group_vars/pitaas_<env>.yml (e.g. pitaas_dev.yml).
+#
+# ★ This file is the project descriptor for the pitaas stack. New servers
+# (staging, prod) reuse this file unchanged; only the per-env file differs.
+# Same shape will apply to lgs.yml and rpkg.yml when those projects land.
+
+project: pitaas
+
+# --- FE (pitaas_frontend monorepo) --------------------------------------
+# ★ Local source path on the WSL controller (where lazydog invokes from)
+fe_repo_local: /home/amd/projects/pitaas_frontend
+fe_node_version: "20"
+fe_pnpm_version: "9.12.0"
+
+# ★ Remote target — pitaas-dev-1
+fe_doc_root: /var/www/pitaas
+
+# ★ Per-bundle deploys. Each entry: { name, apps, dest }
+# apps = list of Vite app names in the monorepo (apps/<name>/)
+# dest = remote path on pitaas-dev-1 where the bundle is served by nginx
+fe_bundles:
+  - name: customer-app
+    apps: [customer]
+    dest: "{{ fe_doc_root }}/customer-app"
+  - name: admin-app
+    apps: [admin]
+    dest: "{{ fe_doc_root }}/admin-app"
+  - name: auditor-app
+    apps: [auditor]
+    dest: "{{ fe_doc_root }}/auditor-app"
+
+# --- BE (pitaas_v3 backend) ---------------------------------------------
+# ★ Local source path on the WSL controller
+be_repo_local: /home/amd/projects/pitaas_v3
+
+# ★ Remote path on pitaas-dev-1
+be_repo_remote: /opt/pitaas/pitaas_v3
+
+# ★ Per-env (overridable in group_vars/pitaas_dev.yml etc.)
+be_compose_project: pitaas_v3
+be_compose_files:
+  - docker/compose.yaml
+  - docker/overrides/compose.mariadb.yaml
+  - docker/overrides/compose.redis.yaml
+  # ★ 2026-10-11: removed compose.noproxy.yaml. With Traefik in play, the
+  # noproxy overlay's frontend host-port binding (HTTP_PUBLISH_PORT) conflicts
+  # with Traefik's 80/443 binding. The frontend now has NO host port
+  # binding; Traefik routes to it via the traefik-public docker network.
+  - docker/overrides/compose.pitaas3-frontend-image.yaml
+  - docker/overrides/compose.pitaas3-apps-mount.yaml
+  - docker/overrides/compose.traefik.yaml
+  - docker/overrides/compose.traefik-ssl.yaml
+  - docker/overrides/compose.multi-bench.yaml
+  - docker/overrides/compose.multi-bench-ssl.yaml
+
+# ★ Services to restart on BE deploy
+be_services_to_restart:
+  - backend
+  - frontend
+  - websocket
+  - scheduler
+  - queue-short
+  - queue-long
+# ★ Services explicitly NOT restarted (configurator runs once; traefik/mariadb/redis don't change)
+be_services_not_restarted:
+  - configurator
+  - traefik
+  - mariadb
+  - redis-cache
+  - redis-queue
+
+# ★ Frappe sites to migrate
+be_sites:
+  - pitaas-v3-dev.local
+  - apex.v3.local
+
+# ★ Pre-deploy backup script (★ on pitaas-dev-1, not the controller).
+# Path is a server-side path. The playbook will warn-and-skip if missing.
+be_backup_script: /opt/pitaas/scripts/backup-all-sites.sh
+
+# --- Common ------------------------------------------------------------
+# Rsync excludes (applied to BOTH fe and be rsync, plus extra per-component excludes)
+common_rsync_excludes:
+  - ".git/"
+  - ".git"
+  - "node_modules/"
+  - ".pytest_cache/"
+  - "__pycache__/"
+  - "*.pyc"
+  - ".vscode/"
+  - ".hermes/"
+  - ".eggs/"
+  - "*.egg-info"
+  - ".DS_Store"
+  - "tmp1"
+  - "gh-token"
+  # ★ Sensitive runtime files: NEVER rsync these from the WSL controller.
+  # They contain secrets (HASHED_PASSWORD, DB password) that are managed
+  # per-host, not from git. Blowing them away with a rsync would break
+  # Traefik basicauth and the MariaDB root password.
+  - "docker/.env"
+  - "docker/.env.*"
+  - ".env"
+  - ".env.*"
+
+# --- Multi-tenant routing ---------------------------------------------
+# Per-domain nginx server blocks (rendered into fe-bundles-nginx.conf by
+# the refresh-nginx playbook). Each entry has:
+#   subdomain:   e.g. "apex" → apex.pitaas.rtcnexora.com
+#   bundle:      one of customer-app | admin-app | auditor-app
+#   frappe_site: the Frappe site name (without the .local suffix); ".local"
+#                is appended for the X-Frappe-Site-Name header
+#   le_cert:     true to request a Let's Encrypt cert for this subdomain
+#                (false = no DNS yet; will use the traefik default cert)
+#
+# ★ New customers: add an entry here + run add-customer.yml. The
+# refresh-nginx.yml playbook regenerates fe-bundles.conf + traefik-file-provider.yml
+# from this list (no hand-editing of nginx/traefik configs required).
+# Explicit subdomain blocks are needed because Traefik's certResolver only
+# auto-detects cert domains from `Host()` rules (not HostRegexp).
+
+# ★ CORS allowed origins for Frappe's allow_cors + the FE dev/manager tools.
+# Sourced by both deploy-be.yml (writes into common_site_config.json on the
+# backend) and refresh-nginx.yml (the nginx layer trusts Frappe's origin
+# echo, so nginx-side doesn't reference this list directly — see the
+# comment block in fe-bundles-nginx.conf.j2 for the design rationale).
+# Add a new dev origin here + run `deploy pitaas pitaas-dev-1 cors:enable`
+# (the future ansible target in step 9 of CORS-2026-10-12).
+nginx_cors_allowed_origins:
+  - "https://dev.pitaas.rtcnexora.com"
+  - "https://apex.pitaas.rtcnexora.com"
+  - "http://localhost:5173"
+  - "http://localhost:3000"
+
+nginx_per_host:
+  - subdomain: apex
+    bundle: customer-app
+    frappe_site: apex.v3
+    le_cert: true
+  - subdomain: dev
+    bundle: customer-app
+    frappe_site: pitaas-v3-dev
+    le_cert: true
+  - subdomain: admin
+    bundle: admin-app
+    frappe_site: pitaas-v3-dev
+    le_cert: false
+  - subdomain: auditor
+    bundle: auditor-app
+    frappe_site: pitaas-v3-dev
+    le_cert: false
+
+# Traefik catch-all regex (matches anything not listed above).
+# Used as the rule for the catch-all router that has no cert.
+# ★ Single-quoted YAML string so the dots are literal (no escape needed;
+# double quotes + \\. would produce \\. in the rendered YAML which is an
+# invalid escape sequence under YAML 1.1, breaking Traefik's parser — see
+# CORS-2026-10-12 bugfix).
+nginx_catchall_subdomain_regex: '^[a-z0-9-]+\.pitaas\.rtcnexora\.com$'

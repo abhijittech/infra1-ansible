@@ -1,0 +1,90 @@
+# Traefik file provider: per-tenant rules (rendered from nginx_per_host)
+# Source of truth: ansible/group_vars/pitaas.yml → nginx_per_host list.
+# ★ DO NOT hand-edit. To add a customer: edit group_vars/pitaas.yml and
+# run add-customer.yml (which calls this template + rsyncs the result).
+
+http:
+  routers:
+    # ----- HTTP → HTTPS redirect for all subdomains -----
+    pitaas-tenant-http:
+      rule: 'HostRegexp(`{{ nginx_catchall_subdomain_regex }}`)'
+      service: pitaas-frontend
+      entryPoints:
+        - http
+      middlewares:
+        - https-redirect
+
+    # ----- Per-domain HTTPS routers (one per nginx_per_host entry) -----
+    # Traefik's certResolver only auto-detects the cert domain from
+    # `Host()` rules (not HostRegexp). So we emit one router per
+    # subdomain where le_cert=true.
+{% for host in nginx_per_host %}
+{% if host.le_cert | default(false) %}
+    {{ host.subdomain }}-https:
+      rule: "Host(`{{ host.subdomain }}.{{ public_domain_apex }}`)"
+      service: pitaas-frontend
+      entryPoints:
+        - https
+      tls:
+        certresolver: le
+      middlewares:
+        - security-headers
+{% endif %}
+{% endfor %}
+
+    # ----- Traefik dashboard -----
+    traefik-https:
+      rule: "Host(`traefik.{{ public_domain_apex }}`)"
+      service: api@internal
+      entryPoints:
+        - https
+      tls:
+        certresolver: le
+
+    # ----- Catch-all HTTPS router -----
+    # Anything not matched above (incl. subdomains where le_cert=false)
+    # gets the traefik default cert (browser warning, but functional).
+    pitaas-tenant-https-catchall:
+      rule: 'HostRegexp(`{{ nginx_catchall_subdomain_regex }}`)'
+      service: pitaas-frontend
+      entryPoints:
+        - https
+      priority: 1
+      middlewares:
+        - security-headers
+
+    # ----- Traefik API (under traefik.<apex>/api) -----
+    api-internal:
+      rule: "Host(`traefik.{{ public_domain_apex }}`) && PathPrefix(`/api`)"
+      service: api@internal
+      entryPoints:
+        - http
+        - https
+
+  services:
+    pitaas-frontend:
+      loadBalancer:
+        servers:
+          - url: "http://pitaas_v3-frontend-1:8080"
+        passHostHeader: true
+
+  middlewares:
+    https-redirect:
+      redirectScheme:
+        scheme: https
+        permanent: true
+
+    security-headers:
+      headers:
+        frameDeny: true
+        sslRedirect: true
+        browserXssFilter: true
+        contentTypeNosniff: true
+        forceSTSHeader: true
+        stsIncludeSubdomains: true
+        stsPreload: true
+        stsSeconds: 31536000
+
+# NOTE: tls.certificatesResolvers.le is configured via the traefik CLI args
+# in compose.traefik.yaml / compose.traefik-ssl.yaml. The file provider
+# doesn't support this section.
