@@ -46,18 +46,56 @@ all:
         # pitaas_prod: (future)
 
     # ============================================================
-    # lgs  (placeholder; lgs_frontend is a separate repo, topology TBD)
+    # lgs  (sales_agentic-ai-middleware)
+    #
+    # 2026-10-15: added lgs_local group (WSL controller, connection=local).
+    # Matches the canonical pitaas_dev pattern but without SSH — see
+    # playbooks/deploy-be-lgs.yml § "★ Pattern A" inline comment.
+    #
+    # 2026-10-15: added lgs_dev group (ssh ubuntu-server, root@:3443).
+    # Uses a dedicated lgs_dev_admin ED25519 key (NOT pitaas_dev_admin
+    # — separate projects get separate automation keys; see plan
+    # §"split by purpose" 2026-10-15). The pubkey was added to
+    # ubuntu-server:/root/.ssh/authorized_keys under comment
+    # `infra1-lgs-dev-2026-10-15`. Verified via
+    # `ansible -i inventory.yml lgs_dev_1 -m ping` on 2026-10-15.
     # ============================================================
-    # lgs:
-    #   children:
-    #     lgs_dev:
-    #       hosts:
-    #         lgs_dev_1:
-    #           ansible_host: ...
-    #           ansible_port: ...
-    #           ansible_user: ...
-    #           server_id: lgs-dev-1
-    #           env: dev
+    lgs:
+      children:
+        lgs_local:
+          hosts:
+            lgs_local_1:                                  # WSL controller (this machine)
+              server_id: lgs-local-1
+              env: local
+              ansible_connection: local                   # ★ Pattern A: no SSH
+              ansible_python_interpreter: /usr/bin/python3
+        lgs_dev:
+          hosts:
+            lgs_dev_1:                                    # production-ish: ssh ubuntu-server
+              ansible_host: 103.228.151.57
+              ansible_port: 3443
+              ansible_user: root
+              # ★ Per-host override: dedicated LGS automation key.
+              # (Pitfall: do NOT use the pitaas_dev_admin default
+              # for LGS — cross-project key reuse is what we're
+              # explicitly avoiding. Each project owns its admin key.)
+              ansible_ssh_private_key_file: ~/.hermes/profiles/infra1/ssh/lgs_dev_admin
+              server_id: lgs-dev-1
+              os_hostname: HYRH-VPC106
+              env: dev
+              ansible_python_interpreter: /usr/bin/python3
+        lgs_fe_dev:
+          hosts:
+            lgs_fe_dev_1:                                 # FE role on the same physical server
+              ansible_host: 103.228.151.57
+              ansible_port: 3443
+              ansible_user: root
+              # ★ Same key as lgs_dev_1 (FE is part of the same LGS project).
+              ansible_ssh_private_key_file: ~/.hermes/profiles/infra1/ssh/lgs_dev_admin
+              server_id: lgs-fe-dev-1
+              os_hostname: HYRH-VPC106
+              env: dev
+              ansible_python_interpreter: /usr/bin/python3
 
     # ============================================================
     # rpkg  (placeholder; rpkg infra TBD)

@@ -1,0 +1,15 @@
+# ~/.hermes/profiles/infra1/ansible/group_vars/lgs_dev.yml
+# Per-env overrides for the LGS dev target (ssh ubuntu-server).
+#
+# Mirrors the shape of group_vars/lgs_local.yml; only the path differs
+# because the source tree lives at /root/projs/lgs/... on the remote
+# (vs /home/amd/projects/... on the WSL controller).
+#
+# compose_env_file is INHERITED from group_vars/lgs.yml as
+# "{{ be_repo }}/.env.development", so flipping be_repo here is
+# sufficient — the env file path follows automatically.
+#
+# Created: 2026-10-15 (Lift 2: ssh target for LGS deploy dispatcher)
+# Mirrors the pitaas_dev pattern (per-env var file under group_vars/).
+
+be_repo: /root/projs/lgs/sales_agentic-ai-middleware

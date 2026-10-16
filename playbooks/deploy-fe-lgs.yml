@@ -1,0 +1,277 @@
+---
+# ~/.hermes/profiles/infra1/ansible/playbooks/deploy-fe-lgs.yml
+# LGS FE deploy dispatcher — single-bundle CRA, build on WSL, rsync to remote.
+#
+# Source: git@github.com:abhijittech/sales-agentic-ai-frontend.git
+# Local:  /home/amd/projects/lgs_frontend (controller-side)
+# Remote: ubuntu-server:/var/www/optileads/ (nginx doc root)
+#
+# Single playbook, multi-action. Dispatched via --extra-vars fe_action=<X>:
+#   fe_action=deploy     → pull, build (if needed), rsync, cache-bust
+#   fe_action=status     → read-only: HEAD, build mtime, doc-root size
+#   fe_action=rollback   → (future) restore from /var/www/optileads.bak.<ts>
+#
+# Usage via bin/deploy (always --check first, per README §67 durable preference):
+#   deploy lgs lgs-fe-dev-1 fe-status --check --diff     # safe smoke
+#   deploy lgs lgs-fe-dev-1 fe-status                    # live read-only
+#   deploy lgs lgs-fe-dev-1 fe --check --diff            # rsync dry-run
+#   deploy lgs lgs-fe-dev-1 fe                           # live (build + rsync)
+#
+# Direct ansible-playbook invocation (for ad-hoc ops):
+#   ansible-playbook -i inventory.yml playbooks/deploy-fe-lgs.yml \
+#       --limit lgs_fe_dev_1 --extra-vars "fe_action=deploy"
+#
+# Idempotency notes:
+#   - deploy: fe_needs_build gates the build (no-op if source unchanged);
+#     rsync's --delete --checksum ensures only changed files are transferred.
+#   - status: read-only (changed_when: false on every task).
+#   - rollback: not yet implemented; fails with explicit message.
+
+- name: "LGS FE — action={{ fe_action | default('status') }} on {{ inventory_hostname }}"
+  hosts: lgs_fe_dev                                # single-host group; --limit scopes further
+  gather_facts: false                              # controller-side preflight only
+  vars:
+    # All FE-specific vars are inherited from group_vars/lgs_fe_dev.yml.
+    # Ansible merges host_vars + group_vars + play vars automatically —
+    # do NOT redeclare fe_repo / fe_branch / etc. here.
+
+  tasks:
+
+    # -----------------------------------------------------------------
+    # 0. Guard: refuse --check on destructive actions
+    # -----------------------------------------------------------------
+    - name: "[guard] Refuse --check on the rollback action"
+      ansible.builtin.fail:
+        msg: "{{ fe_action }} is destructive; remove --check to apply."
+      when:
+        - ansible_check_mode | bool
+        - fe_action in ['rollback']
+
+    # -----------------------------------------------------------------
+    # 1. Preflight (local) — verify controller has the tools
+    # -----------------------------------------------------------------
+    - name: "[local] Verify node is installed"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.command: node --version
+      register: node_check
+      changed_when: false
+      failed_when: node_check.rc != 0
+
+    - name: "[local] Verify npm is installed"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.command: npm --version
+      register: npm_check
+      changed_when: false
+      failed_when: npm_check.rc != 0
+
+    - name: "[local] Soft-check node major version (want {{ fe_node_version }})"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.debug:
+        msg: "node --version = {{ node_check.stdout }}; .nvmrc wants {{ fe_node_version }}. (Soft check — proceed either way.)"
+      when: fe_node_version not in node_check.stdout
+
+    - name: "[local] Verify the FE repo exists at {{ fe_repo }}"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.stat:
+        path: "{{ fe_repo }}/package.json"
+      register: fe_repo_stat
+      failed_when: not fe_repo_stat.stat.exists
+
+    - name: "[remote] Verify SSH to {{ ansible_user }}@{{ ansible_host }}:{{ ansible_port }} works"
+      ansible.builtin.ping:
+
+    # -----------------------------------------------------------------
+    # 2. Pull (local) — fail-closed git pull --ff-only
+    # -----------------------------------------------------------------
+    - name: "[local] git pull --ff-only origin {{ fe_branch }}"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.command: "git pull --ff-only origin {{ fe_branch }}"
+      args:
+        chdir: "{{ fe_repo }}"
+      register: fe_pull
+      changed_when: "'Fast-forward' in fe_pull.stdout or 'Already up to date' not in fe_pull.stdout"
+      when: fe_action in ['deploy']
+
+    - name: "[local] Print pull result"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.debug:
+        msg: "{{ fe_pull.stdout_lines | default(['(no pull — not a deploy action)']) }}"
+      when: fe_action in ['deploy']
+
+    # -----------------------------------------------------------------
+    # 3. Decide (local) — fe_needs_build
+    # -----------------------------------------------------------------
+    - name: "[local] Stat build/{{ fe_build_output_dir }}/index.html"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.stat:
+        path: "{{ fe_repo }}/{{ fe_build_output_dir }}/index.html"
+      register: fe_build_index_stat
+
+    - name: "[local] fe_needs_build = (no build/) OR (source newer than build/)"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.set_fact:
+        fe_needs_build: >-
+          {{
+            (not fe_build_index_stat.stat.exists) or
+            (fe_build_index_stat.stat.mtime < fe_repo_stat.stat.mtime)
+          }}
+
+    - name: "[local] Print fe_needs_build"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.debug:
+        msg: >-
+          fe_needs_build = {{ fe_needs_build }}.
+          build/index.html exists = {{ fe_build_index_stat.stat.exists | default(false) }}.
+          build/index.html mtime = {{ fe_build_index_stat.stat.mtime | default('(missing)') }}.
+          fe_repo mtime = {{ fe_repo_stat.stat.mtime }}.
+
+    # -----------------------------------------------------------------
+    # 4. Build (local) — npm ci + npm run build, gated
+    # -----------------------------------------------------------------
+    - name: "[local] npm ci (skipped in --check mode)"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.command: npm ci
+      args:
+        chdir: "{{ fe_repo }}"
+      register: fe_npm_ci
+      changed_when: "'added' in fe_npm_ci.stdout or 'removed' in fe_npm_ci.stdout"
+      when:
+        - fe_action in ['deploy']
+        - fe_needs_build | bool
+        - not ansible_check_mode | bool
+
+    - name: "[local] npm run build (CRA → ./{{ fe_build_output_dir }}/)"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.command: "npm run build"
+      args:
+        chdir: "{{ fe_repo }}"
+      register: fe_npm_build
+      changed_when: true
+      when:
+        - fe_action in ['deploy']
+        - fe_needs_build | bool
+        - not ansible_check_mode | bool
+
+    - name: "[local] Verify build/index.html was produced"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.stat:
+        path: "{{ fe_repo }}/{{ fe_build_output_dir }}/index.html"
+      register: fe_build_index_post
+      failed_when: not fe_build_index_post.stat.exists
+      when:
+        - fe_action in ['deploy']
+        - fe_needs_build | bool
+        - not ansible_check_mode | bool
+
+    # -----------------------------------------------------------------
+    # 5. Sync (remote via ssh) — rsync build/ → /var/www/optileads/
+    # -----------------------------------------------------------------
+    - name: "[remote] rsync {{ fe_build_output_dir }}/ → {{ fe_nginx_doc_root }}/ (--delete --checksum)"
+      ansible.posix.synchronize:
+        src: "{{ fe_repo }}/{{ fe_build_output_dir }}/"
+        dest: "{{ fe_nginx_doc_root }}/"
+        delete: yes
+        recursive: yes
+        checksum: yes
+        rsync_opts:
+          - "--exclude=.git"
+      register: fe_rsync
+      when: fe_action in ['deploy']
+
+    - name: "[remote] Print rsync result"
+      ansible.builtin.debug:
+        msg: >-
+          rsync done. files_changed={{ (fe_rsync.stdout | default('')) | length }} bytes.
+          {% if ansible_check_mode | bool %}(this was a DRY RUN — no files were actually transferred){% endif %}
+      when: fe_action in ['deploy']
+
+    # -----------------------------------------------------------------
+    # 6. Cache-bust (remote) — touch index.html + any post-deploy steps
+    # -----------------------------------------------------------------
+    - name: "[remote] Run fe_post_deploy_steps (cache-bust + future hooks)"
+      ansible.builtin.command: "{{ item }}"
+      loop: "{{ fe_post_deploy_steps | default([]) }}"
+      changed_when: true
+      when: fe_action in ['deploy']
+
+    # -----------------------------------------------------------------
+    # 7. STATUS (read-only) — git HEAD, build mtime, doc-root size
+    # -----------------------------------------------------------------
+    # Note: ansible.builtin.command does NOT use a shell, so arguments
+    # containing spaces (like the git log --format=... string) get
+    # split into separate argv entries and fail with "ambiguous argument".
+    # Use shell: for anything with multi-arg strings, then promote the
+    # registered stdout to host scope via set_fact (delegate_to's register
+    # is in the delegated host's scope, not the play host's).
+    - name: "[local] STATUS — git HEAD on {{ fe_repo }}"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.shell: "git log -1 --format='%H  %an  %s  %cI'"
+      args:
+        chdir: "{{ fe_repo }}"
+      register: _fe_status_head_cmd
+      changed_when: false
+      when: fe_action in ['status']
+
+    - name: "[local] STATUS — promote fe_status_head to host scope"
+      ansible.builtin.set_fact:
+        fe_status_head: "{{ _fe_status_head_cmd.stdout | default('(no head)') }}"
+      when: fe_action in ['status']
+
+    - name: "[local] STATUS — stat build/{{ fe_build_output_dir }}/index.html"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.stat:
+        path: "{{ fe_repo }}/{{ fe_build_output_dir }}/index.html"
+      register: fe_build_index_stat_status
+      when: fe_action in ['status']
+
+    - name: "[local] STATUS — build/index.html mtime"
+      ansible.builtin.set_fact:
+        fe_status_build_mtime: >-
+          {% if fe_build_index_stat_status.stat.exists %}
+          {{ fe_build_index_stat_status.stat.mtime }}
+          {% else %}
+          (NO BUILD)
+          {% endif %}
+      when: fe_action in ['status']
+
+    - name: "[remote] STATUS — doc root contents + size"
+      ansible.builtin.shell: "ls -la {{ fe_nginx_doc_root }}/ | head -10 && du -sh {{ fe_nginx_doc_root }}/"
+      register: _fe_status_doc_root_cmd
+      changed_when: false
+      when: fe_action in ['status']
+
+    - name: "[local] STATUS — print summary"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.debug:
+        msg:
+          - "FE git HEAD: {{ fe_status_head | default('(no head)') }}"
+          - "FE build/ mtime: {{ fe_status_build_mtime | default('(no build)') }}"
+          - "FE nginx doc root (size + first 10 lines):"
+          - "{{ _fe_status_doc_root_cmd.stdout_lines | default(['(no doc root info)']) }}"
+      when: fe_action in ['status']
+
+    # -----------------------------------------------------------------
+    # 8. ROLLBACK (future)
+    # -----------------------------------------------------------------
+    - name: "[rollback] Not yet implemented"
+      ansible.builtin.fail:
+        msg: |
+          fe_action=rollback is not yet implemented.
+          Manual rollback path: restore /var/www/optileads from /var/www/optileads.bak.<timestamp>.
+          See /opt/lgs_frontend/deploy.sh comment header for the snapshot convention.
+      when: fe_action in ['rollback']

@@ -1,0 +1,94 @@
+# ~/.hermes/profiles/infra1/ansible/group_vars/lgs.yml
+# Project layer for LGS (sales_agentic-ai-middleware).
+#
+# This file applies to ALL hosts in the `lgs_<env>` groups. Per-env overrides
+# live in group_vars/lgs_<env>.yml (e.g. lgs_local.yml).
+#
+# Schema mirrors group_vars/pitaas.yml. Same shape as pitaas — future
+# ansible operators will recognize the variable names.
+# Created: 2026-10-15 (LGS WSL local ansible phase)
+
+project: lgs
+
+# --- BE source location (controller-side; check the canonical WSL repo path) ---
+be_repo: /home/amd/projects/sales_agentic-ai-middleware
+
+# Remote target path is per-env. For WSL local, ansible_connection=local
+# means there is NO remote path; the controller's path is used directly.
+# For the future lgs_dev (ssh ubuntu-server), override be_repo_remote
+# in group_vars/lgs_dev.yml.
+
+# --- Docker compose ---
+be_compose_project: lgs
+be_compose_files:
+  - docker-compose.yml
+# compose_env_file is derived from be_repo so per-env overrides
+# (group_vars/lgs_local.yml, group_vars/lgs_dev.yml) only need to
+# set be_repo. Matches the Makefile's $ENV_FILE = .env.development
+# convention and the deploy-backend.sh script on ubuntu-server.
+compose_env_file: "{{ be_repo }}/.env.development"
+
+# --- Services (canonical names from docker-compose.yml) ---
+# These are the services compose up/down affect. Use these names directly
+# with `docker compose ... -p lgs <action> <svc>` for per-service control.
+be_services:
+  - gennxt_middleware_s
+  - gnx_core_worker
+  - gnx_telemetry_worker
+  - gnx_beat_scheduler
+  - gnx_campaign_worker
+  - flower
+
+# Services brought up by `deploy lgs lgs-local-1 up-infra`
+# (postgres + redis + middleware — minimal for iterate-fast work).
+be_services_infra:
+  - postgres_swarmai
+  - redis
+  - gennxt_middleware_s
+
+# --- Common rsync excludes (used when ansible copies source to a remote) ---
+# For WSL local, no rsync happens; this is for the future lgs_dev (ssh)
+# target where ansible.builtin.synchronize will mirror the repo.
+common_rsync_excludes:
+  - ".git/"
+  - ".git"
+  - ".pytest_cache/"
+  - ".import_linter_cache/"
+  - "__pycache__/"
+  - "*.pyc"
+  - ".vscode/"
+  - ".hermes/"
+  - ".hermes_embedded/"
+  - ".worktrees/"
+  - "hermes-agent-local-src/"
+  - ".aider.chat.history.md"
+  - ".aider.input.history"
+  - ".aider.tags.cache.v4/"
+  - "models/"
+  - "models_gguf/"
+  - "venv/"
+  - "venv1/"
+  - "external-hermes-bridge/"
+  - "external_hermes_docker_data/"
+  - "opencode.jsonc"
+  - "var/"
+  - ".env"                 # NEVER rsync the controller's dev .env
+  - ".env.*"
+  - "*.rendered"
+  - ".ansible/"
+  - "*.retry"
+  - ".DS_Store"
+  - "*.swp"
+  - "*~"
+
+# --- Deploy contract ---
+# Operations that deployments should NOT clobber (per the MVP 1.0 PR
+# shipped 2026-10-15, commit e4fedc3 + alembic p1a2b3c4d603):
+#   app_configurations.external_search_dispatch_enabled must remain "0"
+#   on the ubuntu-server unless an operator explicitly flipped it via
+#   AdminService.upsert_config. The deploy-be-lgs playbook does NOT
+#   touch this row; it is the operator's lever.
+mvp_apify_guard:
+  app_config_key: external_search_dispatch_enabled
+  default_value: "0"
+  comment: "DO NOT touch in this playbook. Operators flip via admin UI."

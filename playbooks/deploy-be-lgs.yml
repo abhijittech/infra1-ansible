@@ -1,0 +1,111 @@
+---
+# ~/.hermes/profiles/infra1/ansible/playbooks/deploy-be-lgs.yml
+# LGS deploy dispatcher for ANY LGS host (WSL local + ssh remote).
+#
+# Single playbook, multi-action, multi-target. Dispatched via:
+#   --extra-vars lgs_action=<X>    (action: up|up-infra|down|migrate|status)
+#   --limit <host>                  (target host, e.g. lgs_local_1, lgs_dev_1)
+#
+# Hosts are scoped via the parent group `lgs` (defined in inventory.yml
+# with children lgs_local and lgs_dev). The dispatcher's `--limit` picks
+# one target per invocation; `--all` (no --limit) runs both.
+#
+# Actions:
+#   lgs-up         → bring the full docker stack up (11 services).
+#   lgs-up-infra   → bring only postgres + redis + gennxt_middleware_s.
+#   lgs-down       → tear the stack down (volumes preserved). DESTRUCTIVE.
+#   lgs-migrate    → run `alembic upgrade head` in the middleware container.
+#   lgs-status     → show `docker compose ps`.
+#
+# Usage via bin/deploy (always --check first, per README §67 durable preference):
+#   deploy lgs lgs-local-1 status --check --diff     # safe smoke (WSL local)
+#   deploy lgs lgs-local-1 status                    # live read-only (WSL local)
+#   deploy lgs lgs-dev-1   status --check --diff     # safe smoke (ubuntu-server)
+#   deploy lgs lgs-dev-1   status                    # live read-only (ubuntu-server)
+#   deploy lgs lgs-local-1 up --check --diff
+#   deploy lgs lgs-local-1 up                        # live
+#   deploy lgs lgs-dev-1   up --check --diff
+#   deploy lgs lgs-dev-1   up                        # live
+#   deploy lgs lgs-local-1 migrate                   # alembic upgrade head
+#   deploy lgs lgs-dev-1   down                      # destructive; no --check
+#
+# Direct ansible-playbook invocation (for ad-hoc ops):
+#   ansible-playbook -i inventory.yml playbooks/deploy-be-lgs.yml \
+#       --limit lgs_dev_1 --extra-vars "lgs_action=up"
+#
+# Idempotency notes:
+#   - up / up-infra / migrate: naturally idempotent (compose up -d is,
+#     and alembic upgrade head noops at HEAD).
+#   - down: DESTRUCTIVE. The guard task refuses --check.
+#   - status: read-only (changed_when: false).
+
+- name: "LGS BE — action={{ lgs_action | default('status') }} on {{ inventory_hostname }}"
+  hosts: lgs                                 # parent group; --limit scopes to one target
+  gather_facts: false                        # both WSL local and ssh targets have no facts we need
+  vars:
+    # compose_env_file is INHERITED from group_vars/lgs.yml as
+    # "{{ be_repo }}/.env.development". Per-host be_repo is set in
+    # group_vars/lgs_local.yml (WSL) and group_vars/lgs_dev.yml
+    # (ubuntu-server). Ansible merges host_vars + group_vars + play
+    # vars automatically — do NOT redeclare be_repo or compose_env_file
+    # here.
+    compose_project: lgs
+    compose_base: "docker compose --env-file {{ compose_env_file }} -p {{ compose_project }}"
+
+  tasks:
+
+    # -----------------------------------------------------------------
+    # 0. Guard: refuse --check on destructive actions
+    # -----------------------------------------------------------------
+    - name: "[guard] Refuse --check on destructive actions"
+      ansible.builtin.fail:
+        msg: "{{ lgs_action }} is destructive; remove --check to apply. Use the Makefile directly for emergency rollback."
+      when:
+        - ansible_check_mode | bool
+        - lgs_action in ['down']
+
+    # -----------------------------------------------------------------
+    # 1. UP — bring the full LGS docker stack up
+    # -----------------------------------------------------------------
+    - name: "UP — bring the full LGS docker stack up"
+      ansible.builtin.command: "{{ compose_base }} -f {{ be_repo }}/docker-compose.yml up -d"
+      when: lgs_action == 'up'
+      changed_when: true
+
+    # -----------------------------------------------------------------
+    # 2. UP-INFRA — bring only postgres + redis + middleware
+    # -----------------------------------------------------------------
+    - name: "UP-INFRA — bring only postgres + redis + middleware"
+      ansible.builtin.command: "{{ compose_base }} -f {{ be_repo }}/docker-compose.yml up -d {{ be_services_infra | join(' ') }}"
+      when: lgs_action == 'up-infra'
+      changed_when: true
+
+    # -----------------------------------------------------------------
+    # 3. DOWN — tear the LGS stack down (volumes preserved)
+    # -----------------------------------------------------------------
+    - name: "DOWN — tear the LGS stack down (preserves volumes)"
+      ansible.builtin.command: "{{ compose_base }} -f {{ be_repo }}/docker-compose.yml down"
+      when: lgs_action == 'down'
+      changed_when: true
+
+    # -----------------------------------------------------------------
+    # 4. MIGRATE — alembic upgrade head in the middleware container
+    # -----------------------------------------------------------------
+    - name: "MIGRATE — alembic upgrade head in the middleware container"
+      ansible.builtin.command: "{{ compose_base }} -f {{ be_repo }}/docker-compose.yml exec -T gennxt_middleware_s alembic upgrade head"
+      when: lgs_action == 'migrate'
+      changed_when: true
+
+    # -----------------------------------------------------------------
+    # 5. STATUS — show running compose services (read-only)
+    # -----------------------------------------------------------------
+    - name: "STATUS — show running compose services"
+      ansible.builtin.command: "{{ compose_base }} -f {{ be_repo }}/docker-compose.yml ps"
+      when: lgs_action == 'status'
+      changed_when: false
+      register: lgs_status_result
+
+    - name: "STATUS — print compose ps result"
+      ansible.builtin.debug:
+        msg: "{{ lgs_status_result.stdout_lines | default(['(no output)']) }}"
+      when: lgs_action == 'status'
