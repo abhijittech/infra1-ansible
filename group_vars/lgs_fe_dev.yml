@@ -1,0 +1,26 @@
+# ~/.hermes/profiles/infra1/ansible/group_vars/lgs_fe_dev.yml
+# Per-env overrides for the LGS FE dev target.
+#
+# Source repo: git@github.com:abhijittech/sales-agentic-ai-frontend.git
+# Local clone: /home/amd/projects/lgs_frontend
+# Build tool:  Create React App (CRA 5.0.1) — NOT Vite; outputs to ./build/
+# Node version: 24.13.1 (pinned in .nvmrc)
+#
+# Build pipeline (ansible-driven, 2026-10-15):
+#   1. controller: git pull (--ff-only)
+#   2. controller: npm ci + npm run build (warm ~/.npm cache)
+#   3. controller → remote: rsync --delete --checksum build/ → /var/www/optileads/
+#   4. remote:      touch /var/www/optileads/index.html (cache-bust)
+#
+# Replaces the manual /opt/lgs_frontend/deploy.sh. The systemd
+# lgs-frontend-webhook.service was disabled 2026-10-15 (ansible is
+# now the source of truth).
+# Created: 2026-10-15 (Lift 3)
+
+fe_repo: /home/amd/projects/lgs_frontend
+fe_branch: main
+fe_nginx_doc_root: /var/www/optileads
+fe_build_output_dir: build             # CRA convention (not dist/, which is Vite)
+fe_node_version: "24"                   # from .nvmrc; soft check in playbook
+fe_post_deploy_steps:
+  - "touch /var/www/optileads/index.html"   # cache-bust against edge caches

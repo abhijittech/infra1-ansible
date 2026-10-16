@@ -1,16 +1,11 @@
 # ★ infra1-ansible gitignore
 # Per-project secrets live in infra1/<server_id>/ (e.g. infra1/pitaas-dev-1/mariadb-root).
 # NEVER commit those files; they're per-host passwords.
-infra1/*/mariadb-root
-infra1/*/mariadb-password
-infra1/*/db-password
-infra1/*/encryption-key
-infra1/*/seed-admin-password
-infra1/*/*password*
-infra1/*/*secret*
-infra1/*/*.key
-infra1/*/*.pem
-infra1/*/known_hosts
+# ★ The entire infra1/ tree is per-host secrets + docs-for-operator-only;
+# nothing in infra1/ should be committed. We do NOT want the README.md inside
+# infra1/ either — operators read infra1/README.md in the hermes profile state
+# directly, not from this repo.
+infra1/
 
 # Rendered artifacts (the refresh-nginx playbook writes to cache/scratch/ — generated, not source)
 cache/

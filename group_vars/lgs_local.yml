@@ -1,0 +1,21 @@
+# ~/.hermes/profiles/infra1/ansible/group_vars/lgs_local.yml
+# Per-env layer for LGS-on-WSL (the controller itself).
+#
+# Loaded only for hosts in the lgs_local group. Stays minimal: WSL is
+# the simplest target type (ansible_connection: local). The bulk of
+# the vars for this env are inherited from group_vars/lgs.yml.
+# Created: 2026-10-15 (LGS WSL local ansible phase)
+
+env: local
+
+# --- Controller identity (used by audit lines and journal paths) ---
+# `whoami` and `hostname` resolved at playbook run time; no static
+# override needed here.
+controller_user: amd
+
+# --- WSL docker compose env file (sibling of docker-compose.yml) ---
+# compose_env_file is now INHERITED from group_vars/lgs.yml as
+# "{{ be_repo }}/.env.development" — no need to hardcode here.
+
+# --- Workdir for run-time artifacts (audit logs, scratch) ---
+audit_log_dir: /home/amd/.hermes/profiles/infra1/work/journal
