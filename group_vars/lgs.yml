@@ -22,11 +22,17 @@ be_repo: /home/amd/projects/sales_agentic-ai-middleware
 be_compose_project: lgs
 be_compose_files:
   - docker-compose.yml
-# compose_env_file is derived from be_repo so per-env overrides
-# (group_vars/lgs_local.yml, group_vars/lgs_dev.yml) only need to
-# set be_repo. Matches the Makefile's $ENV_FILE = .env.development
-# convention and the deploy-backend.sh script on ubuntu-server.
-compose_env_file: "{{ be_repo }}/.env.development"
+# compose_env_file is derived from be_repo AND the per-env env-file NAME,
+# so per-env overrides (group_vars/lgs_local.yml, group_vars/lgs_dev.yml)
+# only need to set compose_env_name (and be_repo for the remote path).
+#
+#   lgs_local.yml -> .env.development  (WSL: CRA dev server on :3000)
+#   lgs_dev.yml   -> .env.production   (ubuntu-server: optileads.gennxt.co)
+#
+# The env file is UNTRACKED + GITIGNORED on each host, so `git merge
+# --ff-only origin/main` during lgs-redeploy NEVER clobbers it. Each host
+# owns its own copy. Ansible picks the NAME; the file stays local.
+compose_env_file: "{{ be_repo }}/{{ compose_env_name | default('.env.development') }}"
 
 # --- Services (canonical names from docker-compose.yml) ---
 # These are the services compose up/down affect. Use these names directly

@@ -13,9 +13,13 @@ env: local
 # override needed here.
 controller_user: amd
 
-# --- WSL docker compose env file (sibling of docker-compose.yml) ---
-# compose_env_file is now INHERITED from group_vars/lgs.yml as
-# "{{ be_repo }}/.env.development" — no need to hardcode here.
+# --- WSL env file ---
+# The WSL dev stack runs the CRA frontend on localhost:3000, so
+# LGS_APP_URL must stay http://localhost:3000 here.
+#
+# The env file itself is UNTRACKED + GITIGNORED (see the LGS repo's
+# .gitignore) — ansible selects it by NAME, the file stays local.
+compose_env_name: .env.development
 
 # --- Workdir for run-time artifacts (audit logs, scratch) ---
 audit_log_dir: /home/amd/.hermes/profiles/infra1/work/journal

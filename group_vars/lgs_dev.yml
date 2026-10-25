@@ -13,3 +13,19 @@
 # Mirrors the pitaas_dev pattern (per-env var file under group_vars/).
 
 be_repo: /root/projs/lgs/sales_agentic-ai-middleware
+
+# --- ubuntu-server env file ---
+# Production talks to the real frontend at https://optileads.gennxt.co.
+# A SEPARATE file (not .env.development) means the WSL dev value can
+# never leak into production, and prod values can never break dev.
+#
+# The env file itself is UNTRACKED + GITIGNORED (see the LGS repo's
+# .gitignore) — ansible selects it by NAME, the file stays local.
+#
+# It MUST be created on the host before the first deploy:
+#   cd /root/projs/lgs/sales_agentic-ai-middleware
+#   cp .env.development .env.production
+#   sed -i 's|^LGS_APP_URL=.*|LGS_APP_URL=https://optileads.gennxt.co|' .env.production
+# The predeploy guard (scripts/lgs_predeploy_check.py) refuses to deploy
+# if this file is missing or holds a dev-only URL.
+compose_env_name: .env.production

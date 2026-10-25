@@ -40,17 +40,70 @@
 #   - status: read-only (changed_when: false).
 
 - name: "LGS BE — action={{ lgs_action | default('status') }} on {{ inventory_hostname }}"
-  hosts: lgs                                 # parent group; --limit scopes to one target
+  # ★ SCOPE (2026-10-25): lgs_local,lgs_dev — NOT the bare `lgs` parent group.
+  #   The parent `lgs` group ALSO contains lgs_fe_dev_1, whose inherited
+  #   `be_repo` is the WSL path — the BE playbook FAILS there ("host not found"
+  #   on the remote path, and it would pull the controller's repo). Using
+  #   `lgs:lgs_dev` does NOT fix this: that is a UNION and still includes
+  #   lgs_fe_dev_1 (verified 2026-10-25). The FE has its own playbook
+  #   (deploy-fe-lgs.yml) scoped to lgs_fe_dev.
+  hosts: lgs_local,lgs_dev
   gather_facts: false                        # both WSL local and ssh targets have no facts we need
   vars:
     # compose_env_file is INHERITED from group_vars/lgs.yml as
-    # "{{ be_repo }}/.env.development". Per-host be_repo is set in
-    # group_vars/lgs_local.yml (WSL) and group_vars/lgs_dev.yml
-    # (ubuntu-server). Ansible merges host_vars + group_vars + play
-    # vars automatically — do NOT redeclare be_repo or compose_env_file
-    # here.
+    # "{{ be_repo }}/{{ compose_env_name | default('.env.development') }}".
+    # compose_env_name is set per-env in group_vars/lgs_local.yml
+    # (.env.development) and group_vars/lgs_dev.yml (.env.production).
+    # Per-host be_repo is set in those same files. Ansible merges
+    # host_vars + group_vars + play vars automatically — do NOT redeclare
+    # be_repo or compose_env_file here.
     compose_project: lgs
-    compose_base: "docker compose --env-file {{ compose_env_file }} -p {{ compose_project }}"
+    # ★ COMPOSE PROJECT (2026-10-25): the live stack on ubuntu-server is
+    # under the DEFAULT compose project, NOT `-p lgs`.
+    #
+    # Verified 2026-10-25 by reading the `com.docker.compose.project`
+    # label off ALL 8 live containers — every one of them reports
+    # `sales_agentic-ai-middleware` (the default basename of the repo
+    # dir), because no env file sets COMPOSE_PROJECT_NAME:
+    #
+    #   gnx_middleware_api_c      sales_agentic-ai-middleware
+    #   core_task_celeryworker_c  sales_agentic-ai-middleware
+    #   cron_celery_beat_c        sales_agentic-ai-middleware
+    #   gnx_campaign_worker_c     sales_agentic-ai-middleware
+    #   telemetry_celeryworker_c  sales_agentic-ai-middleware
+    #   gnx_pg_db_c               sales_agentic-ai-middleware
+    #   gnx_redis_c               sales_agentic-ai-middleware
+    #   flower_monitor_c          sales_agentic-ai-middleware
+    #
+    # So `-p lgs` was pointing compose at a project that owns NOTHING:
+    #   - lgs-status printed an EMPTY table (the live containers are not
+    #     in that project),
+    #   - lgs-up tried to CREATE a second copy of every container_name
+    #     → "Conflict. The container name ... is already in use",
+    #   - lgs-down SILENTLY DID NOTHING (it tore down an empty project).
+    #
+    # ⇒ ALL actions now use the DEFAULT project. `live_project_base` is
+    # the correct base for every action; `compose_base` (with `-p lgs`)
+    # is kept only for reference and MUST NOT be used against the live
+    # stack.
+    #
+    # ★ Do NOT add `-p <project>` unless COMPOSE_PROJECT_NAME is set in
+    #   the env file — the two must always agree.
+    live_project_base: "docker compose --env-file {{ compose_env_file }} -f {{ be_repo }}/docker-compose.yml"
+    # ★ Services recreated by lgs-redeploy. All of them live under the
+    #   DEFAULT project (see the label dump above) — an earlier version of
+    #   this comment claimed the stack was SPLIT across two projects
+    #   ("lgs" + default). That was WRONG: all 8 containers are under
+    #   the default project. Recreating a service under the wrong
+    #   project is a hard failure (compose tries to CREATE a second
+    #   container with the same fixed `container_name` → conflict).
+    redeploy_services_default:
+      - gennxt_middleware_s
+      - gnx_campaign_worker
+      - gnx_core_worker
+      - gnx_telemetry_worker
+      - gnx_beat_scheduler
+      - flower
 
   tasks:
 
@@ -68,7 +121,7 @@
     # 1. UP — bring the full LGS docker stack up
     # -----------------------------------------------------------------
     - name: "UP — bring the full LGS docker stack up"
-      ansible.builtin.command: "{{ compose_base }} -f {{ be_repo }}/docker-compose.yml up -d"
+      ansible.builtin.command: "{{ live_project_base }} up -d"
       when: lgs_action == 'up'
       changed_when: true
 
@@ -76,7 +129,7 @@
     # 2. UP-INFRA — bring only postgres + redis + middleware
     # -----------------------------------------------------------------
     - name: "UP-INFRA — bring only postgres + redis + middleware"
-      ansible.builtin.command: "{{ compose_base }} -f {{ be_repo }}/docker-compose.yml up -d {{ be_services_infra | join(' ') }}"
+      ansible.builtin.command: "{{ live_project_base }} up -d {{ be_services_infra | join(' ') }}"
       when: lgs_action == 'up-infra'
       changed_when: true
 
@@ -84,7 +137,7 @@
     # 3. DOWN — tear the LGS stack down (volumes preserved)
     # -----------------------------------------------------------------
     - name: "DOWN — tear the LGS stack down (preserves volumes)"
-      ansible.builtin.command: "{{ compose_base }} -f {{ be_repo }}/docker-compose.yml down"
+      ansible.builtin.command: "{{ live_project_base }} down"
       when: lgs_action == 'down'
       changed_when: true
 
@@ -92,15 +145,199 @@
     # 4. MIGRATE — alembic upgrade head in the middleware container
     # -----------------------------------------------------------------
     - name: "MIGRATE — alembic upgrade head in the middleware container"
-      ansible.builtin.command: "{{ compose_base }} -f {{ be_repo }}/docker-compose.yml exec -T gennxt_middleware_s alembic upgrade head"
+      ansible.builtin.command: "{{ live_project_base }} exec -T gennxt_middleware_s alembic upgrade head"
       when: lgs_action == 'migrate'
       changed_when: true
 
     # -----------------------------------------------------------------
-    # 5. STATUS — show running compose services (read-only)
+    # 5. REDEPLOY — pull + FORCE-RECREATE the app layer under the
+    #    DEFAULT compose project (the one that owns the live app
+    #    containers on ubuntu-server). Added 2026-10-24.
+    #
+    #    Why --force-recreate is REQUIRED: the containers bind-mount
+    #    ./middleware_core:/code, so a `git pull` changes the files the
+    #    container SEES — but the RUNNING process keeps the old
+    #    bytecode. A plain `compose up -d` reports "Running" and
+    #    recreates NOTHING (the compose config is unchanged), so the
+    #    fix never loads. --force-recreate is the only thing that
+    #    makes the new code live.
+    #
+    #    Why the DEFAULT project (no -p lgs): the live app containers
+    #    were created without -p lgs. Using -p lgs would attempt to
+    #    CREATE duplicates of the same container_name → conflict.
+    # -----------------------------------------------------------------
+    - name: "REDEPLOY — preflight: refuse a dev-only LGS_APP_URL on a non-local host"
+      # ★ BE twin of the FE's scripts/prebuild-check.js (2026-10-16).
+      #
+      # The welcome email's dashboard CTA renders `{{ app_url }}`, which
+      # comes from LGS_APP_URL. If the wrong per-host env file is
+      # selected, production ships `http://localhost:3000` and the
+      # customer gets an email whose button points at their own machine
+      # (the bug reported on 2026-10-25).
+      #
+      # This runs BEFORE the git pull so a bad env fails fast, before the
+      # running stack is touched. It runs ON THE TARGET because the env
+      # file lives there — be_repo is the server path for lgs_dev_1 and
+      # the WSL path for lgs_local_1 (same machine, so it works for
+      # both).
+      #
+      # lgs_local_1 gets --local because the WSL stack legitimately uses
+      # http://localhost:3000.
+      ansible.builtin.command: >-
+        python3 {{ be_repo }}/scripts/lgs_predeploy_check.py
+        --env-file {{ compose_env_file }}
+        {% if inventory_hostname == 'lgs_local_1' %}--local{% endif %}
+      args:
+        chdir: "{{ be_repo }}"
+      changed_when: false
+      when: lgs_action == 'redeploy'
+
+    - name: "REDEPLOY — refuse to run with tracked-file changes in the repo"
+      ansible.builtin.shell: |
+        cd {{ be_repo }} && git status --porcelain --untracked-files=no
+      register: lgs_redeploy_dirty
+      changed_when: false
+      when: lgs_action == 'redeploy'
+
+    - name: "REDEPLOY — abort if the working tree has tracked-file changes"
+      ansible.builtin.fail:
+        msg: >-
+          Tracked-file changes present in {{ be_repo }}. Commit or stash
+          them on the server before redeploying. Output:
+          {{ lgs_redeploy_dirty.stdout | default('') }}
+      when:
+        - lgs_action == 'redeploy'
+        - (lgs_redeploy_dirty.stdout | default('')) | length > 0
+
+    - name: "REDEPLOY — git fetch + checkout main + pull --ff-only"
+      # `shell: true` is REQUIRED here: the `&&` chaining is handled by
+      # the remote shell. With ansible.builtin.command the string is
+      # split on whitespace and `git fetch` receives the literal tokens
+      # "&&", "git", "checkout", ... → "unknown option `ff-only`".
+      ansible.builtin.shell: |
+        set -euo pipefail
+        git fetch origin
+        git checkout main
+        # Use merge --ff-only origin/main, NOT pull --ff-only origin main.
+        # The server refspec is the wide default (all branches), so
+        # 'git pull --ff-only origin main' tries to fast-forward MULTIPLE
+        # branches and fails with "Cannot fast-forward to multiple
+        # branches". 'git merge --ff-only origin/main' advances only the
+        # current branch and still refuses to create a merge commit, so a
+        # divergent server tree fails loudly instead of silently merging.
+        git merge --ff-only origin/main
+        git rev-parse --short HEAD
+      args:
+        chdir: "{{ be_repo }}"
+        # The remote default shell is dash (/bin/sh), which has no
+        # `set -o pipefail`. Force bash so the strict-mode preamble works.
+        executable: /bin/bash
+      register: lgs_redeploy_pull
+      changed_when: true
+      when: lgs_action == 'redeploy'
+
+    - name: "REDEPLOY — remove orphaned Created-state containers from a prior aborted run"
+      # A previous failed redeploy can leave a "<hash>_<container_name>"
+      # container in "Created" state. It holds the container_name and
+      # blocks the next create with a name conflict. Only "Created"
+      # (never-started) containers are removed — anything Up/Running is
+      # left alone.
+      ansible.builtin.shell: |
+        set -euo pipefail
+        # NOTE: no Go-template braces anywhere in this script — Jinja
+        # templates the whole shell body, and a literal brace pair
+        # breaks it. We use `docker ps -a` plain output plus awk
+        # instead of `--format`.
+        docker ps -a --filter status=created --no-trunc \
+          | awk 'NR>1 && $1 ~ /^[0-9a-f]{12}$/ {print $1, $2}' \
+          | while read -r cid cname; do
+              case "${cname}" in
+                gnx_*|core_task_*|telemetry_*|cron_celery_*|flower_*|*-gnx_*|*-core_task_*|*-telemetry_*|*-cron_celery_*|*-flower_*)
+                  echo "removing orphan: ${cname} (${cid})"
+                  docker rm -f "${cid}" >/dev/null
+                  ;;
+              esac
+            done
+      args:
+        executable: /bin/bash
+      register: lgs_redeploy_orphan
+      changed_when: "'removing orphan' in (lgs_redeploy_orphan.stdout | default(''))"
+      when: lgs_action == 'redeploy'
+
+    - name: "REDEPLOY — stop+remove the DEFAULT-project app containers (infra untouched)"
+      # ★ We REMOVE-then-CREATE rather than using `--force-recreate`.
+      # `--force-recreate` makes compose create the replacement
+      # container BEFORE removing the old one, and both briefly want the
+      # SAME fixed `container_name` →
+      #   "Error when allocating new name: Conflict. The container name
+      #    /gnx_campaign_worker_c is already in use"
+      # which aborts the recreate and leaves a half-torn-down stack.
+      # Removing first makes the name free before the create.
+      # The script lives in the SERVER's repo (it was just pulled by
+      # the git task above). `ansible.builtin.command` runs it in place
+      # on the server — `ansible.builtin.script` would look for the file
+      # on the CONTROLLER, and it has no `remote_src` option.
+      ansible.builtin.command: "bash {{ be_repo }}/scripts/lgs_deploy_recreate_app_containers.sh"
+      args:
+        chdir: "{{ be_repo }}"
+      register: lgs_redeploy_rm_default
+      changed_when: "'removing:' in (lgs_redeploy_rm_default.stdout | default(''))"
+      when: lgs_action == 'redeploy'
+
+    - name: "REDEPLOY — create + start the app-layer containers under the DEFAULT project"
+      # ★ All six app services are recreated under the DEFAULT compose
+      # project (no -p lgs). That is where the live stack lives:
+      # `docker ps -a` shows every app container with the
+      # `sales_agentic-ai-middleware` project label, because there is
+      # no COMPOSE_PROJECT_NAME in the env file.
+      #
+      # Using `-p lgs` (the old `compose_base`) would create a SECOND
+      # copy of every container under a different project while the
+      # same fixed `container_name` is still held -> "Conflict. The
+      # container name ... is already in use".
+      ansible.builtin.command: >-
+        {{ live_project_base }} up -d --no-deps
+        {{ redeploy_services_default | join(' ') }}
+      register: lgs_redeploy_up_default
+      changed_when: true
+      when: lgs_action == 'redeploy'
+
+    - name: "REDEPLOY — wait for the middleware API to answer /openapi.json (max 60s)"
+      ansible.builtin.uri:
+        url: http://localhost:8000/openapi.json
+        method: GET
+        status_code: 200
+        validate_certs: false
+      register: lgs_redeploy_health
+      retries: 30
+      delay: 2
+      until: lgs_redeploy_health is not failed
+      changed_when: false
+      when: lgs_action == 'redeploy'
+
+    - name: "REDEPLOY — alembic upgrade head (idempotent at HEAD)"
+      # gennxt_middleware_s lives in the DEFAULT project on
+      # ubuntu-server, so this must use live_project_base (no -p lgs).
+      ansible.builtin.command: >-
+        {{ live_project_base }} exec -T gennxt_middleware_s alembic upgrade head
+      register: lgs_redeploy_migrate
+      changed_when: true
+      when: lgs_action == 'redeploy'
+
+    - name: "REDEPLOY — print the recreate + health result"
+      ansible.builtin.debug:
+        msg: >-
+          pull={{ lgs_redeploy_pull.stdout_lines | default(['(no output)']) }}
+          | orphans={{ lgs_redeploy_orphan.stdout_lines | default(['(none)']) }}
+          | health={{ lgs_redeploy_health.status | default('?') }}
+          | alembic={{ lgs_redeploy_migrate.stdout_lines | default(['(no output)']) }}
+      when: lgs_action == 'redeploy'
+
+    # -----------------------------------------------------------------
+    # 6. STATUS — show running compose services (read-only)
     # -----------------------------------------------------------------
     - name: "STATUS — show running compose services"
-      ansible.builtin.command: "{{ compose_base }} -f {{ be_repo }}/docker-compose.yml ps"
+      ansible.builtin.command: "{{ live_project_base }} ps"
       when: lgs_action == 'status'
       changed_when: false
       register: lgs_status_result

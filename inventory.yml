@@ -1,12 +1,15 @@
 # ~/.hermes/profiles/infra1/ansible/inventory.yml
 # Multi-project, multi-server inventory. One host per (project, env, server_id) row.
 #
-# ★ The projects/<slug>.yaml is the human-readable source of truth for
-# env-keyed SSH creds. This inventory is what Ansible consumes; the
-# shared shape is duplicated by design (Ansible needs a specific format).
-# When projects/<slug>.yaml changes, run scripts/regen-inventory.sh to
-# regenerate this file. (regen-inventory.sh is a small Python script
-# that reads each project's YAML and writes the corresponding hosts.)
+# ★ The projects/<slug>.yaml files in ~/.hermes/profiles/infra1/projects/
+#   are the human-readable documentation of each project's servers, ports,
+#   domains and env topology. They are NOT machine-generated and NOTHING
+#   reads them at deploy time.
+#
+# ★ The REAL source of truth that Ansible consumes is THIS FILE plus
+#   group_vars/. `projects/<slug>.yaml` is a human-readable MIRROR — keep
+#   it accurate by hand (the LGS one was corrected on 2026-10-25 after it
+#   was found to be entirely <TODO> and factually wrong).
 #
 # Conventions:
 # - server_id is kebab-case: <project>-<env>-<N> (e.g., pitaas-dev-1)
