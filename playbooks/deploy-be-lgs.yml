@@ -89,7 +89,28 @@
     #
     # ★ Do NOT add `-p <project>` unless COMPOSE_PROJECT_NAME is set in
     #   the env file — the two must always agree.
-    live_project_base: "docker compose --env-file {{ compose_env_file }} -f {{ be_repo }}/docker-compose.yml"
+    # ★ LGS_COMPOSE_ENV_FILE (2026-10-25): the compose file's SERVICE-level
+    # `env_file:` is interpolated from this var, so the injected env file
+    # matches the one ansible selected.
+    #
+    # WHY THIS IS NEEDED: a hardcoded `env_file: .env.development` always
+    # injects the DEV file's values into the container on EVERY host. Worse,
+    # compose's container config hash does NOT include the env_file
+    # CONTENTS, so `up -d` does NOT recreate a container when only that
+    # file's contents differ — it just re-applies the dev values to the
+    # running container. On 2026-10-25 that silently reverted LGS_APP_URL
+    # to http://localhost:3000 in PRODUCTION after a deploy that passed
+    # the predeploy guard (the guard checks the env FILE, not the
+    # container).
+    #
+    # The value is the BASENAME, resolved relative to the compose file's
+    # directory (which is be_repo). Set it per-env next to
+    # compose_env_name so the two can never drift apart.
+    lgs_compose_env_file: "{{ compose_env_name | default('.env.development') }}"
+    live_project_base: >-
+      docker compose
+      --env-file {{ compose_env_file }}
+      -f {{ be_repo }}/docker-compose.yml
     # ★ Services recreated by lgs-redeploy. All of them live under the
     #   DEFAULT project (see the label dump above) — an earlier version of
     #   this comment claimed the stack was SPLIT across two projects
@@ -122,6 +143,11 @@
     # -----------------------------------------------------------------
     - name: "UP — bring the full LGS docker stack up"
       ansible.builtin.command: "{{ live_project_base }} up -d"
+      environment:
+        # ★ The compose file interpolates ${LGS_COMPOSE_ENV_FILE} for the
+        # service-level `env_file:`. Without this the container keeps
+        # receiving the dev env file's values on production.
+        LGS_COMPOSE_ENV_FILE: "{{ lgs_compose_env_file }}"
       when: lgs_action == 'up'
       changed_when: true
 
@@ -130,6 +156,11 @@
     # -----------------------------------------------------------------
     - name: "UP-INFRA — bring only postgres + redis + middleware"
       ansible.builtin.command: "{{ live_project_base }} up -d {{ be_services_infra | join(' ') }}"
+      environment:
+        # ★ The compose file interpolates ${LGS_COMPOSE_ENV_FILE} for the
+        # service-level `env_file:`. Without this the container keeps
+        # receiving the dev env file's values on production.
+        LGS_COMPOSE_ENV_FILE: "{{ lgs_compose_env_file }}"
       when: lgs_action == 'up-infra'
       changed_when: true
 
@@ -138,6 +169,11 @@
     # -----------------------------------------------------------------
     - name: "DOWN — tear the LGS stack down (preserves volumes)"
       ansible.builtin.command: "{{ live_project_base }} down"
+      environment:
+        # ★ The compose file interpolates ${LGS_COMPOSE_ENV_FILE} for the
+        # service-level `env_file:`. Without this the container keeps
+        # receiving the dev env file's values on production.
+        LGS_COMPOSE_ENV_FILE: "{{ lgs_compose_env_file }}"
       when: lgs_action == 'down'
       changed_when: true
 
@@ -146,6 +182,11 @@
     # -----------------------------------------------------------------
     - name: "MIGRATE — alembic upgrade head in the middleware container"
       ansible.builtin.command: "{{ live_project_base }} exec -T gennxt_middleware_s alembic upgrade head"
+      environment:
+        # ★ The compose file interpolates ${LGS_COMPOSE_ENV_FILE} for the
+        # service-level `env_file:`. Without this the container keeps
+        # receiving the dev env file's values on production.
+        LGS_COMPOSE_ENV_FILE: "{{ lgs_compose_env_file }}"
       when: lgs_action == 'migrate'
       changed_when: true
 
@@ -307,6 +348,11 @@
       ansible.builtin.command: >-
         {{ live_project_base }} up -d --no-deps
         {{ redeploy_services_default | join(' ') }}
+      environment:
+        # ★ The compose file interpolates ${LGS_COMPOSE_ENV_FILE} for the
+        # service-level `env_file:`. Without this the container keeps
+        # receiving the dev env file's values on production.
+        LGS_COMPOSE_ENV_FILE: "{{ lgs_compose_env_file }}"
       register: lgs_redeploy_up_default
       changed_when: true
       when: lgs_action == 'redeploy'
@@ -324,11 +370,55 @@
       changed_when: false
       when: lgs_action == 'redeploy'
 
+    - name: "REDEPLOY — assert the containers actually got the per-host LGS_APP_URL"
+      # ★ 2026-10-25: the env-file PREDEPLOY guard checks the env FILE.
+      # It cannot see that the container ended up with a DIFFERENT value,
+      # because the compose file's service-level `env_file:` injects a
+      # file whose CONTENTS are not part of compose's container config
+      # hash — so `up -d` re-applies them to the running container
+      # without recreating it. That silently reverted LGS_APP_URL to
+      # http://localhost:3000 in production on 2026-10-25 AFTER a
+      # deploy that passed the guard.
+      #
+      # This post-condition check closes that gap: it asserts the RUNNING
+      # container has the expected value, not the env file.
+      ansible.builtin.command: >-
+        docker exec {{ item }} printenv LGS_APP_URL
+      loop:
+        - gnx_middleware_api_c
+        - core_task_celeryworker_c
+        - cron_celery_beat_c
+        - gnx_campaign_worker_c
+        - telemetry_celeryworker_c
+      register: lgs_redeploy_appurl
+      changed_when: false
+      when: lgs_action == 'redeploy'
+
+    - name: "REDEPLOY — abort if any container has the wrong LGS_APP_URL"
+      ansible.builtin.fail:
+        msg: >-
+          Container {{ item.item }} has LGS_APP_URL={{ item.stdout | default('') }}
+          but this host expects {{ expected_app_url }}.
+          The compose env file was not applied to the running containers.
+      loop: "{{ lgs_redeploy_appurl.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('?') }}"
+      vars:
+        expected_app_url: "{{ 'http://localhost:3000' if inventory_hostname == 'lgs_local_1' else 'https://optileads.gennxt.co' }}"
+      when:
+        - lgs_action == 'redeploy'
+        - (item.stdout | default('')) != expected_app_url
+
     - name: "REDEPLOY — alembic upgrade head (idempotent at HEAD)"
       # gennxt_middleware_s lives in the DEFAULT project on
       # ubuntu-server, so this must use live_project_base (no -p lgs).
       ansible.builtin.command: >-
         {{ live_project_base }} exec -T gennxt_middleware_s alembic upgrade head
+      environment:
+        # ★ The compose file interpolates ${LGS_COMPOSE_ENV_FILE} for the
+        # service-level `env_file:`. Without this the container keeps
+        # receiving the dev env file's values on production.
+        LGS_COMPOSE_ENV_FILE: "{{ lgs_compose_env_file }}"
       register: lgs_redeploy_migrate
       changed_when: true
       when: lgs_action == 'redeploy'
@@ -347,6 +437,11 @@
     # -----------------------------------------------------------------
     - name: "STATUS — show running compose services"
       ansible.builtin.command: "{{ live_project_base }} ps"
+      environment:
+        # ★ The compose file interpolates ${LGS_COMPOSE_ENV_FILE} for the
+        # service-level `env_file:`. Without this the container keeps
+        # receiving the dev env file's values on production.
+        LGS_COMPOSE_ENV_FILE: "{{ lgs_compose_env_file }}"
       when: lgs_action == 'status'
       changed_when: false
       register: lgs_status_result
