@@ -166,32 +166,6 @@
     #    were created without -p lgs. Using -p lgs would attempt to
     #    CREATE duplicates of the same container_name → conflict.
     # -----------------------------------------------------------------
-    - name: "REDEPLOY — preflight: refuse a dev-only LGS_APP_URL on a non-local host"
-      # ★ BE twin of the FE's scripts/prebuild-check.js (2026-10-16).
-      #
-      # The welcome email's dashboard CTA renders `{{ app_url }}`, which
-      # comes from LGS_APP_URL. If the wrong per-host env file is
-      # selected, production ships `http://localhost:3000` and the
-      # customer gets an email whose button points at their own machine
-      # (the bug reported on 2026-10-25).
-      #
-      # This runs BEFORE the git pull so a bad env fails fast, before the
-      # running stack is touched. It runs ON THE TARGET because the env
-      # file lives there — be_repo is the server path for lgs_dev_1 and
-      # the WSL path for lgs_local_1 (same machine, so it works for
-      # both).
-      #
-      # lgs_local_1 gets --local because the WSL stack legitimately uses
-      # http://localhost:3000.
-      ansible.builtin.command: >-
-        python3 {{ be_repo }}/scripts/lgs_predeploy_check.py
-        --env-file {{ compose_env_file }}
-        {% if inventory_hostname == 'lgs_local_1' %}--local{% endif %}
-      args:
-        chdir: "{{ be_repo }}"
-      changed_when: false
-      when: lgs_action == 'redeploy'
-
     - name: "REDEPLOY — refuse to run with tracked-file changes in the repo"
       ansible.builtin.shell: |
         cd {{ be_repo }} && git status --porcelain --untracked-files=no
@@ -234,6 +208,41 @@
         executable: /bin/bash
       register: lgs_redeploy_pull
       changed_when: true
+      when: lgs_action == 'redeploy'
+
+    - name: "REDEPLOY — preflight: refuse a dev-only LGS_APP_URL on a non-local host"
+      # ★ BE twin of the FE's scripts/prebuild-check.js (2026-10-16).
+      #
+      # The welcome email's dashboard CTA renders `{{ app_url }}`, which
+      # comes from LGS_APP_URL. If the wrong per-host env file is
+      # selected, production ships `http://localhost:3000` and the
+      # customer gets an email whose button points at their own machine
+      # (the bug reported on 2026-10-25).
+      #
+      # ★ ORDERING (2026-10-25): this runs AFTER the git pull, not
+      #   before. The guard script itself arrives WITH the pull
+      #   (scripts/lgs_predeploy_check.py is tracked), so running it
+      #   first fails with "can't open file ... No such file or
+      #   directory" on any host that has not pulled yet.
+      #
+      # It still fails FAST relative to the destructive part: the pull
+      # only advances the working tree — the running stack is not
+      # touched until the recreate task below. So a bad env aborts the
+      # deploy BEFORE any container is recreated.
+      #
+      # It runs ON THE TARGET because the env file lives there —
+      # be_repo is the server path for lgs_dev_1 and the WSL path for
+      # lgs_local_1 (same machine, so it works for both).
+      #
+      # lgs_local_1 gets --local because the WSL stack legitimately uses
+      # http://localhost:3000.
+      ansible.builtin.command: >-
+        python3 {{ be_repo }}/scripts/lgs_predeploy_check.py
+        --env-file {{ compose_env_file }}
+        {% if inventory_hostname == 'lgs_local_1' %}--local{% endif %}
+      args:
+        chdir: "{{ be_repo }}"
+      changed_when: false
       when: lgs_action == 'redeploy'
 
     - name: "REDEPLOY — remove orphaned Created-state containers from a prior aborted run"
