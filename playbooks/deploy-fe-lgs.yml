@@ -107,22 +107,82 @@
     # -----------------------------------------------------------------
     # 3. Decide (local) — fe_needs_build
     # -----------------------------------------------------------------
+    # ★ GATE SOURCE OF TRUTH = git HEAD, not a file mtime.
+    #
+    # History: the gate used to be
+    #     build/index.html.mtime  <  package.json.mtime
+    # which silently SKIPPED the build for any PR that did not touch
+    # package.json — a real incident on 2026-10-26 (PR #9 changed 27
+    # src/ files, the deploy reported success, and the remote kept
+    # serving the OLD bundle). mtimes of individual files are also
+    # unreliable after a git checkout (git does not preserve them).
+    #
+    # Now: the build writes its git HEAD into
+    #   build/.hermes-build-stamp
+    # and the gate compares that stamp against the CURRENT git HEAD.
+    # Different (or missing) stamp => rebuild. This is exact.
     - name: "[local] Stat build/{{ fe_build_output_dir }}/index.html"
       delegate_to: localhost
       connection: local
       ansible.builtin.stat:
         path: "{{ fe_repo }}/{{ fe_build_output_dir }}/index.html"
       register: fe_build_index_stat
+      check_mode: no
 
-    - name: "[local] fe_needs_build = (no build/) OR (source newer than build/)"
+    # NOTE: use `command`, NOT `shell`, and force check_mode: no.
+    #  - `shell` has no check-mode support and is skipped under --check.
+    #  - a task with delegate_to is skipped under --check by default.
+    # Both would register an EMPTY stdout, which silently made the gate
+    # think HEAD was unknown and always report "needs build".
+    # This task is strictly READ-ONLY, so running it under --check is
+    # safe and makes --check and live runs behave identically.
+    - name: "[local] Read current git HEAD of {{ fe_repo }}"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.command: "git rev-parse HEAD"
+      args:
+        chdir: "{{ fe_repo }}"
+      register: _fe_head_cmd
+      changed_when: false
+      check_mode: no
+
+    - name: "[local] Read the build stamp (git HEAD the bundle was built from)"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.slurp:
+        src: "{{ fe_repo }}/{{ fe_build_output_dir }}/.hermes-build-stamp"
+      register: _fe_stamp_slurp
+      failed_when: false
+      changed_when: false
+      check_mode: no
+
+    # ★ Both values are captured on the CONTROLLER in ONE delegated task,
+    #   so they land in the same scope and can never read back empty.
+    #   (A fact set under delegate_to: localhost is scoped to localhost;
+    #    a register from a delegated task likewise lives in the delegated
+    #    host's scope — mixing the two silently yields empty strings.)
+    - name: "[local] Promote fe_current_head and fe_stamp_head to host scope"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.set_fact:
+        fe_current_head: "{{ _fe_head_cmd.stdout | default('') | trim }}"
+        fe_stamp_head: >-
+          {{ (_fe_stamp_slurp.content | default('') | b64decode | trim)
+             if (_fe_stamp_slurp.content | default('')) else '' }}
+      register: _fe_scope_promote
+      check_mode: no
+
+    - name: "[local] fe_needs_build = (no build/) OR (stamp missing) OR (stamp != HEAD)"
       delegate_to: localhost
       connection: local
       ansible.builtin.set_fact:
         fe_needs_build: >-
           {{
             (not fe_build_index_stat.stat.exists) or
-            (fe_build_index_stat.stat.mtime < fe_repo_stat.stat.mtime)
+            (fe_stamp_head | length == 0) or
+            (fe_stamp_head != fe_current_head)
           }}
+      check_mode: no
 
     - name: "[local] Print fe_needs_build"
       delegate_to: localhost
@@ -132,7 +192,9 @@
           fe_needs_build = {{ fe_needs_build }}.
           build/index.html exists = {{ fe_build_index_stat.stat.exists | default(false) }}.
           build/index.html mtime = {{ fe_build_index_stat.stat.mtime | default('(missing)') }}.
-          fe_repo mtime = {{ fe_repo_stat.stat.mtime }}.
+          current git HEAD = {{ fe_current_head | default('(unknown)') }}.
+          build stamp      = {{ fe_stamp_head | default('(missing)') | truncate(12, true, '') }}.
+      check_mode: no
 
     # -----------------------------------------------------------------
     # 4. Build (local) — npm ci + npm run build, gated
@@ -175,6 +237,52 @@
         - fe_needs_build | bool
         - not ansible_check_mode | bool
 
+    # ★ Record WHICH git HEAD this bundle was built from, so the next
+    #   run can decide "is the build current?" exactly (see §3).
+    - name: "[local] Write build stamp (git HEAD of the bundle)"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.shell: "git rev-parse HEAD > {{ fe_build_output_dir }}/.hermes-build-stamp"
+      args:
+        chdir: "{{ fe_repo }}"
+      changed_when: true
+      check_mode: no
+      when:
+        - fe_action in ['deploy']
+        - fe_needs_build | bool
+        - not ansible_check_mode | bool
+
+    - name: "[local] Verify build stamp content"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.slurp:
+        src: "{{ fe_repo }}/{{ fe_build_output_dir }}/.hermes-build-stamp"
+      register: _fe_stamp_verify
+      changed_when: false
+      when:
+        - fe_action in ['deploy']
+        - fe_needs_build | bool
+        - not ansible_check_mode | bool
+
+    # NOTE: delegated, like the promote task above — the facts
+    # (fe_current_head) live in the delegated scope, so the assert must
+    # run in that same scope or it will compare against an empty string.
+    - name: "[local] Assert build stamp matches the current git HEAD"
+      delegate_to: localhost
+      connection: local
+      ansible.builtin.assert:
+        that:
+          - (_fe_stamp_verify.content | b64decode | trim) == fe_current_head
+        fail_msg: >-
+          build stamp ({{ _fe_stamp_verify.content | b64decode | trim }})
+          does not match git HEAD ({{ fe_current_head }}) — the bundle
+          was NOT built from the checked-out commit. Refusing to deploy.
+        success_msg: "build stamp == git HEAD ({{ fe_current_head | truncate(12, true, '') }})"
+      when:
+        - fe_action in ['deploy']
+        - fe_needs_build | bool
+        - not ansible_check_mode | bool
+
     # -----------------------------------------------------------------
     # 5. Sync (remote via ssh) — rsync build/ → /var/www/optileads/
     # -----------------------------------------------------------------
@@ -187,6 +295,9 @@
         checksum: yes
         rsync_opts:
           - "--exclude=.git"
+          # The build stamp is local deploy metadata — never publish it
+          # to the public web root.
+          - "--exclude=.hermes-build-stamp"
       register: fe_rsync
       when: fe_action in ['deploy']
 
